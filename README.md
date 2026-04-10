@@ -36,6 +36,24 @@ uv python install 3.13
 
 La ruta antigua con `venv + pip` sigue funcionando, pero ya no es el flujo principal.
 
+## Tests
+
+Suite local, sin depender de proveedores externos:
+
+```bash
+uv run pytest -q
+```
+
+Smoke tests reales contra Notion y OpenAI:
+
+```bash
+uv run pytest -q -m integration tests/test_live_integrations.py
+```
+
+Esos tests usan la configuración activa del entorno y validan:
+- que Notion responde una consulta real sobre el CRM configurado
+- que OpenAI responde una llamada real del planner
+
 ## Variables de entorno
 
 Revisa [`.env.example`](/home/gidiom/Wabog/salesAgent/.env.example). Para desarrollo, el servicio funciona con SQLite y un CRM en memoria. Para producción, usa `Postgres` en `DATABASE_URL` y configura `CRM_BACKEND=notion`.
