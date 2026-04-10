@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+from uuid import uuid4
+
+from sales_agent.domain.models import CRMContact
+
+
+class InMemoryCRMAdapter:
+    def __init__(self) -> None:
+        self._contacts_by_phone: dict[str, CRMContact] = {}
+        self._contacts_by_id: dict[str, CRMContact] = {}
+        self.followups: list[dict] = []
+
+    async def find_contact_by_phone(self, phone_number: str) -> CRMContact | None:
+        return self._contacts_by_phone.get(phone_number)
+
+    async def create_contact(self, phone_number: str, full_name: str | None = None) -> CRMContact:
+        existing = self._contacts_by_phone.get(phone_number)
+        if existing:
+            return existing
+        contact = CRMContact(
+            external_id=f"mem-{uuid4().hex[:10]}",
+            phone_number=phone_number,
+            full_name=full_name,
+            stage="new",
+        )
+        self._contacts_by_phone[phone_number] = contact
+        self._contacts_by_id[contact.external_id] = contact
+        return contact
+
+    async def update_contact_fields(self, external_id: str, fields: dict) -> CRMContact:
+        contact = self._contacts_by_id[external_id]
+        updated = contact.model_copy(update=fields)
+        self._contacts_by_id[external_id] = updated
+        self._contacts_by_phone[updated.phone_number] = updated
+        return updated
+
+    async def append_note(self, external_id: str, note: str) -> CRMContact:
+        contact = self._contacts_by_id[external_id]
+        updated = contact.model_copy(update={"notes": [*contact.notes, note]})
+        self._contacts_by_id[external_id] = updated
+        self._contacts_by_phone[updated.phone_number] = updated
+        return updated
+
+    async def change_stage(self, external_id: str, stage: str) -> CRMContact:
+        return await self.update_contact_fields(external_id, {"stage": stage})
+
+    async def create_followup(self, external_id: str, summary: str) -> dict:
+        followup = {"id": f"followup-{uuid4().hex[:8]}", "external_id": external_id, "summary": summary}
+        self.followups.append(followup)
+        return followup

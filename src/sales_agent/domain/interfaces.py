@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, OutboundMessage, ToolExecutionResult
+
+
+class CRMAdapter(Protocol):
+    async def find_contact_by_phone(self, phone_number: str) -> CRMContact | None: ...
+
+    async def create_contact(self, phone_number: str, full_name: str | None = None) -> CRMContact: ...
+
+    async def update_contact_fields(self, external_id: str, fields: dict) -> CRMContact: ...
+
+    async def append_note(self, external_id: str, note: str) -> CRMContact: ...
+
+    async def change_stage(self, external_id: str, stage: str) -> CRMContact: ...
+
+    async def create_followup(self, external_id: str, summary: str) -> dict: ...
+
+
+class MemoryStore(Protocol):
+    async def has_message(self, message_id: str) -> bool: ...
+
+    async def append_message(self, message: ConversationMessage) -> None: ...
+
+    async def get_recent_messages(self, conversation_id: str, limit: int = 8) -> list[ConversationMessage]: ...
+
+    async def remember_contact(self, contact: CRMContact) -> None: ...
+
+    async def get_contact_shadow(self, phone_number: str) -> CRMContact | None: ...
+
+    async def search_memories(self, conversation_id: str, query: str, limit: int = 3) -> list[str]: ...
+
+    async def save_run(
+        self,
+        run_id: str,
+        event: InboundMessage,
+        intent: str,
+        response_text: str,
+        tool_results: list[ToolExecutionResult],
+    ) -> None: ...
+
+
+class ChannelAdapter(Protocol):
+    async def send_text(self, message: OutboundMessage) -> dict: ...
