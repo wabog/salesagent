@@ -267,7 +267,10 @@ async def playground() -> str:
           })
         });
         const data = await response.json();
-        const meta = `intent=${data.intent} | duplicate=${data.duplicate}`;
+        const lead = data.contact?.full_name || data.contact?.phone_number || "sin lead";
+        const stage = data.contact?.stage || "sin etapa";
+        const tools = (data.tool_results || []).map(item => item.action?.type).filter(Boolean).join(", ") || "sin tools";
+        const meta = `intent=${data.intent} | lead=${lead} | etapa=${stage} | tools=${tools}`;
         messages.push({ role: "agent", text: data.response_text, meta });
         saveState(messages);
         render(messages);

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import httpx
@@ -61,19 +62,46 @@ class NotionCRMAdapter:
         return self._to_contact(data)
 
     async def append_note(self, external_id: str, note: str) -> CRMContact:
-        await self._request(
+        page = await self._request("GET", f"/pages/{external_id}")
+        properties = page.get("properties", {})
+        notes_prop = properties.get(self._settings.notion_notes_property, {})
+        current_notes = notes_prop.get("rich_text", [])
+        if not current_notes:
+            current_notes = notes_prop.get("text", [])
+        existing_text = "".join(chunk.get("plain_text", "") for chunk in current_notes).strip()
+        new_value = f"{existing_text}\n{note}".strip() if existing_text else note
+        data = await self._request(
             "PATCH",
-            f"/blocks/{external_id}/children",
-            json={"children": [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": note}}]}}]},
+            f"/pages/{external_id}",
+            json={
+                "properties": {
+                    self._settings.notion_notes_property: {
+                        "rich_text": [{"text": {"content": new_value[:1900]}}]
+                    }
+                }
+            },
         )
-        contact = await self._request("GET", f"/pages/{external_id}")
-        return self._to_contact(contact)
+        return self._to_contact(data)
 
     async def change_stage(self, external_id: str, stage: str) -> CRMContact:
         return await self.update_contact_fields(external_id, {"stage": stage})
 
     async def create_followup(self, external_id: str, summary: str) -> dict:
-        return {"external_id": external_id, "summary": summary, "provider": "notion", "status": "recorded_manually"}
+        await self._request(
+            "PATCH",
+            f"/pages/{external_id}",
+            json={
+                "properties": {
+                    self._settings.notion_next_action_property: {
+                        "date": {"start": date.today().isoformat()}
+                    },
+                    self._settings.notion_last_contact_property: {
+                        "date": {"start": date.today().isoformat()}
+                    },
+                }
+            },
+        )
+        return {"external_id": external_id, "summary": summary, "provider": "notion", "status": "recorded"}
 
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
         async with httpx.AsyncClient(base_url=self._base_url, timeout=20.0) as client:
