@@ -1,0 +1,26 @@
+{
+  "body": {
+    "message": {
+      "from": "573016803866",
+      "id": "wamid.HBgMNTczMDE2ODAzODY2FQIAEhggQUNCNEJFMTJDQ0NFMDVEODNGNUQ5MkZBMEU0RDZGOTgA",
+      "kapso": {
+        "direction": "inbound",
+        "status": "delivered",
+        "processing_status": "pending",
+        "has_media": false,
+        "origin": "cloud_api",
+        "content": "hola puedes revisar notion dime que personas hay en el pipeline"
+      },
+      "text": {
+        "body": "hola puedes revisar notion dime que personas hay en el pipeline"
+      },
+      "timestamp": "1775704462",
+      "type": "text"
+    },
+    "conversation": {
+      "id": "52db4929-5965-45d1-bb4a-b225ec6ad8b8",
+      "contact_name": "user",
+      "phone_number": "573016803866"
+    }
+  }
+}
