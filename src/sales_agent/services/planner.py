@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from textwrap import dedent
 
+from openai import OpenAIError
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -28,7 +29,7 @@ class AgentPlanner:
                 api_key=settings.openai_api_key,
                 model=settings.openai_model,
                 temperature=0.2,
-            ).with_structured_output(PlannerOutput)
+            ).with_structured_output(PlannerOutput, method="function_calling")
 
     async def plan(
         self,
@@ -38,7 +39,10 @@ class AgentPlanner:
         semantic_memories: list[str],
     ) -> PlanningResult:
         if self._llm is not None:
-            return await self._plan_with_llm(text, contact, recent_messages, semantic_memories)
+            try:
+                return await self._plan_with_llm(text, contact, recent_messages, semantic_memories)
+            except OpenAIError:
+                return self._plan_with_rules(text, contact)
         return self._plan_with_rules(text, contact)
 
     async def _plan_with_llm(

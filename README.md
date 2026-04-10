@@ -44,7 +44,19 @@ Revisa [`.env.example`](/home/gidiom/Wabog/salesAgent/.env.example). Para desarr
 
 - `POST /webhooks/whatsapp/kapso`
 - `POST /internal/replay`
+- `POST /chat/local`
+- `GET /playground`
 - `GET /healthz`
+
+## Probar desde chat local
+
+Con la app levantada, abre:
+
+```text
+http://127.0.0.1:8000/playground
+```
+
+Ese playground usa el endpoint `POST /chat/local` para hablar con el agente sin pasar por Kapso. Sirve para probar Notion, OpenAI y memoria conversacional local antes de conectar WhatsApp real.
 
 ## Flujo
 

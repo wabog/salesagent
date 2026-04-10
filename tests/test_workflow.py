@@ -23,7 +23,7 @@ async def build_workflow():
         crm_adapter=crm,
         memory_store=memory,
         channel_adapter=ConsoleChannelAdapter(),
-        planner=AgentPlanner(Settings()),
+        planner=AgentPlanner(Settings(OPENAI_API_KEY="")),
         policy=ToolExecutionPolicy(),
     )
     return workflow, crm, memory
