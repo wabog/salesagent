@@ -55,7 +55,9 @@ class AgentPlanner:
         prompt = dedent(
             f"""
             You are a sales copilot for inbound WhatsApp conversations.
-            Decide the user intent, whether to reply, and which CRM actions to take.
+            The orchestrator has already resolved the current lead from the sender phone number.
+            You can only act on that current lead. Never assume access to other CRM records.
+            Decide the user intent, whether to reply, and which actions to take on the current lead.
 
             Contact:
             {contact.model_dump_json(indent=2) if contact else "None"}
@@ -79,16 +81,6 @@ class AgentPlanner:
         response_lines: list[str] = []
         intent = "generic_reply"
         confidence = 0.55
-
-        if contact is None:
-            actions.append(
-                ProposedAction(
-                    type=ActionType.CREATE_CONTACT,
-                    reason="No existe lead previo para este número.",
-                    args={},
-                )
-            )
-            response_lines.append("Ya tomé tu contacto en el pipeline para seguir la conversación.")
 
         if match := re.search(r"etapa(?:\s+a)?\s+([a-zA-ZáéíóúÁÉÍÓÚ ]+)", lowered):
             stage = match.group(1).strip().title()

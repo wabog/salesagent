@@ -9,7 +9,8 @@ class AgentState(TypedDict):
     event: InboundMessage
     run_id: str
     duplicate: bool
-    contact: CRMContact | None
+    current_lead: CRMContact | None
+    lead_created: bool
     recent_messages: list[dict]
     semantic_memories: list[str]
     planning: PlanningResult

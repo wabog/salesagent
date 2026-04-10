@@ -21,7 +21,6 @@ class Direction(StrEnum):
 
 
 class ActionType(StrEnum):
-    CREATE_CONTACT = "create_contact"
     UPDATE_STAGE = "update_stage"
     APPEND_NOTE = "append_note"
     CREATE_FOLLOWUP = "create_followup"

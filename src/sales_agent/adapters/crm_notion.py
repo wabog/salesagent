@@ -88,7 +88,8 @@ class NotionCRMAdapter:
         phone_prop = properties.get(self._settings.notion_phone_property, {})
         name_chunks = name_prop.get("title", [])
         full_name = "".join(chunk.get("plain_text", "") for chunk in name_chunks) or None
-        stage = stage_prop.get("status", {}).get("name")
+        stage_data = stage_prop.get("status") or {}
+        stage = stage_data.get("name")
         phone_number = phone_prop.get("phone_number")
         return CRMContact(
             external_id=payload["id"],

@@ -10,7 +10,7 @@ from sales_agent.core.config import Settings
 
 @pytest.mark.asyncio
 async def test_healthz_and_webhook_flow():
-    app = create_app(Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:", OPENAI_API_KEY=""))
+    app = create_app(Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:", OPENAI_API_KEY="", CRM_BACKEND="memory"))
     transport = ASGITransport(app=app)
     payload = json.loads(Path("fixtures/kapso_webhook.json").read_text())
 
@@ -27,7 +27,7 @@ async def test_healthz_and_webhook_flow():
 
 @pytest.mark.asyncio
 async def test_local_chat_playground_flow():
-    app = create_app(Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:", OPENAI_API_KEY=""))
+    app = create_app(Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:", OPENAI_API_KEY="", CRM_BACKEND="memory"))
     transport = ASGITransport(app=app)
 
     async with app.router.lifespan_context(app):

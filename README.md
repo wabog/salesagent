@@ -58,12 +58,24 @@ http://127.0.0.1:8000/playground
 
 Ese playground usa el endpoint `POST /chat/local` para hablar con el agente sin pasar por Kapso. Sirve para probar Notion, OpenAI y memoria conversacional local antes de conectar WhatsApp real.
 
+## Regla central del CRM
+
+Cada conversación queda anclada a un solo lead:
+
+1. entra un mensaje con `phone_number`
+2. el orquestador busca ese número en el CRM
+3. si no existe, crea el lead
+4. desde ahí el workflow solo opera sobre ese `current_lead`
+
+El agente no tiene queries abiertas sobre el CRM. Las actions de negocio se ejecutan únicamente a través de tools acotadas al lead resuelto por teléfono.
+
 ## Flujo
 
 1. Normaliza el payload de WhatsApp.
 2. Aplica idempotencia por `message_id`.
-3. Carga contacto, estado conversacional e historial.
-4. Clasifica intención y planea acciones.
-5. Ejecuta tools permitidas.
-6. Persiste run y mensajes.
-7. Envía respuesta por el canal configurado.
+3. Resuelve el `current_lead` por teléfono o lo crea si no existe.
+4. Carga historial y memorias de esa conversación.
+5. Clasifica intención y planea acciones sobre ese lead únicamente.
+6. Ejecuta tools limitadas al `current_lead`.
+7. Persiste run y mensajes.
+8. Envía respuesta por el canal configurado.

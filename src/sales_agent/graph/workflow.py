@@ -7,13 +7,13 @@ from langgraph.graph import END, StateGraph
 from sales_agent.domain.models import (
     ActionType,
     AgentRunResult,
-    CRMContact,
     ConversationMessage,
     Direction,
     OutboundMessage,
     ToolExecutionResult,
 )
 from sales_agent.domain.state import AgentState
+from sales_agent.services.lead_scope import LeadScopedCRMTools
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
 
@@ -32,7 +32,8 @@ class SalesAgentWorkflow:
             "event": event,
             "run_id": uuid4().hex,
             "duplicate": False,
-            "contact": None,
+            "current_lead": None,
+            "lead_created": False,
             "recent_messages": [],
             "semantic_memories": [],
             "planning": None,
@@ -50,13 +51,14 @@ class SalesAgentWorkflow:
             intent=final_state["planning"].intent if final_state["planning"] else "duplicate",
             response_text=final_state["response_text"],
             tool_results=final_state["tool_results"],
-            contact=final_state["contact"],
+            contact=final_state["current_lead"],
         )
 
     def _build_graph(self) -> StateGraph:
         graph = StateGraph(AgentState)
         graph.add_node("dedupe_and_lock", self._dedupe_and_lock)
-        graph.add_node("load_contact_and_context", self._load_contact_and_context)
+        graph.add_node("resolve_current_lead", self._resolve_current_lead)
+        graph.add_node("load_conversation_context", self._load_conversation_context)
         graph.add_node("classify_and_plan", self._classify_and_plan)
         graph.add_node("execute_tools", self._execute_tools)
         graph.add_node("persist_state", self._persist_state)
@@ -68,10 +70,11 @@ class SalesAgentWorkflow:
             self._route_duplicate,
             {
                 "duplicate_end": END,
-                "load_contact_and_context": "load_contact_and_context",
+                "resolve_current_lead": "resolve_current_lead",
             },
         )
-        graph.add_edge("load_contact_and_context", "classify_and_plan")
+        graph.add_edge("resolve_current_lead", "load_conversation_context")
+        graph.add_edge("load_conversation_context", "classify_and_plan")
         graph.add_edge("classify_and_plan", "execute_tools")
         graph.add_edge("execute_tools", "persist_state")
         graph.add_conditional_edges(
@@ -93,15 +96,23 @@ class SalesAgentWorkflow:
         return state
 
     def _route_duplicate(self, state: AgentState) -> str:
-        return "duplicate_end" if state["duplicate"] else "load_contact_and_context"
+        return "duplicate_end" if state["duplicate"] else "resolve_current_lead"
 
-    async def _load_contact_and_context(self, state: AgentState) -> AgentState:
+    async def _resolve_current_lead(self, state: AgentState) -> AgentState:
         contact = await self.crm.find_contact_by_phone(state["event"].phone_number)
         if contact is None:
-            contact = await self.memory.get_contact_shadow(state["event"].phone_number)
+            shadow = await self.memory.get_contact_shadow(state["event"].phone_number)
+            contact = shadow or await self.crm.create_contact(
+                phone_number=state["event"].phone_number,
+                full_name=state["event"].contact_name,
+            )
+            state["lead_created"] = shadow is None
+        state["current_lead"] = contact
+        return state
+
+    async def _load_conversation_context(self, state: AgentState) -> AgentState:
         recent = await self.memory.get_recent_messages(state["event"].conversation_id)
         memories = await self.memory.search_memories(state["event"].conversation_id, state["event"].text)
-        state["contact"] = contact
         state["recent_messages"] = [message.model_dump(mode="json") for message in recent]
         state["semantic_memories"] = memories
         return state
@@ -109,42 +120,32 @@ class SalesAgentWorkflow:
     async def _classify_and_plan(self, state: AgentState) -> AgentState:
         planning = await self.planner.plan(
             text=state["event"].text,
-            contact=state["contact"],
+            contact=state["current_lead"],
             recent_messages=[message["text"] for message in state["recent_messages"]],
             semantic_memories=state["semantic_memories"],
         )
         state["planning"] = planning
-        state["response_text"] = planning.response_text
+        prefix = "Ya registré este número como lead en el CRM. " if state["lead_created"] else ""
+        state["response_text"] = f"{prefix}{planning.response_text}".strip()
         state["send_reply"] = planning.should_reply
         return state
 
     async def _execute_tools(self, state: AgentState) -> AgentState:
         planning = state["planning"]
-        contact = state["contact"]
+        current_lead = state["current_lead"]
+        scoped_tools = LeadScopedCRMTools(self.crm, current_lead)
         results: list[ToolExecutionResult] = []
         for action in planning.actions:
             try:
                 self.policy.validate(action)
-                if action.type == ActionType.CREATE_CONTACT:
-                    contact = await self.crm.create_contact(
-                        phone_number=state["event"].phone_number,
-                        full_name=state["event"].contact_name,
-                    )
-                    payload = contact.model_dump(mode="json")
-                elif action.type == ActionType.UPDATE_STAGE:
-                    if contact is None:
-                        contact = await self.crm.create_contact(state["event"].phone_number, state["event"].contact_name)
-                    contact = await self.crm.change_stage(contact.external_id, action.args["stage"])
-                    payload = contact.model_dump(mode="json")
+                if action.type == ActionType.UPDATE_STAGE:
+                    current_lead = await scoped_tools.update_stage(action.args["stage"])
+                    payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.APPEND_NOTE:
-                    if contact is None:
-                        contact = await self.crm.create_contact(state["event"].phone_number, state["event"].contact_name)
-                    contact = await self.crm.append_note(contact.external_id, action.args["note"])
-                    payload = contact.model_dump(mode="json")
+                    current_lead = await scoped_tools.add_note(action.args["note"])
+                    payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.CREATE_FOLLOWUP:
-                    if contact is None:
-                        contact = await self.crm.create_contact(state["event"].phone_number, state["event"].contact_name)
-                    payload = await self.crm.create_followup(contact.external_id, action.args["summary"])
+                    payload = await scoped_tools.create_followup(action.args["summary"])
                 elif action.type == ActionType.HANDOFF_HUMAN:
                     state["handoff_requested"] = True
                     payload = {"status": "requested"}
@@ -155,7 +156,7 @@ class SalesAgentWorkflow:
                 results.append(ToolExecutionResult(action=action, success=False, error=str(exc)))
                 state["errors"].append(str(exc))
         state["tool_results"] = results
-        state["contact"] = contact
+        state["current_lead"] = current_lead
         return state
 
     async def _persist_state(self, state: AgentState) -> AgentState:
@@ -169,8 +170,8 @@ class SalesAgentWorkflow:
             metadata={"provider": state["event"].provider},
         )
         await self.memory.append_message(inbound)
-        if state["contact"] is not None:
-            await self.memory.remember_contact(state["contact"])
+        if state["current_lead"] is not None:
+            await self.memory.remember_contact(state["current_lead"])
         await self.memory.save_run(
             run_id=state["run_id"],
             event=state["event"],

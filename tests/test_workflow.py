@@ -50,7 +50,9 @@ async def test_workflow_creates_contact_and_updates_stage():
     assert contact is not None
     assert contact.stage == "Demo"
     assert len(recent) == 2
+    assert result.response_text.startswith("Ya registré este número como lead en el CRM.")
     assert recent[-1].text == result.response_text
+    assert all(tool_result.action.type != "create_contact" for tool_result in result.tool_results)
 
 
 @pytest.mark.asyncio
@@ -71,3 +73,26 @@ async def test_workflow_is_idempotent_on_duplicate_message():
     assert first.duplicate is False
     assert second.duplicate is True
     assert second.response_text == ""
+
+
+@pytest.mark.asyncio
+async def test_existing_lead_is_reused_without_creation_side_effect():
+    workflow, crm, _ = await build_workflow()
+    existing = await crm.create_contact("573009998877", "Lead Existente")
+
+    event = InboundMessage(
+        message_id="existing-1",
+        conversation_id="conv-existing",
+        phone_number="573009998877",
+        text="hola",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("573009998877")
+
+    assert result.duplicate is False
+    assert contact is not None
+    assert contact.external_id == existing.external_id
+    assert not result.response_text.startswith("Ya registré este número como lead en el CRM.")
