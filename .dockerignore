@@ -1,0 +1,14 @@
+.git
+.gitignore
+.pytest_cache
+.venv
+.python-version
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+tests/
+fixtures/
+sales_agent.db
+.codex/

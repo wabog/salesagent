@@ -23,8 +23,16 @@ class Settings(BaseSettings):
     kapso_phone_number_id: str | None = Field(default=None, alias="KAPSO_PHONE_NUMBER_ID")
     kapso_api_token: str | None = Field(default=None, alias="KAPSO_API_TOKEN")
     whatsapp_send_enabled: bool = Field(default=False, alias="WHATSAPP_SEND_ENABLED")
+    message_batch_window_seconds: float = Field(default=3.0, alias="MESSAGE_BATCH_WINDOW_SECONDS")
+    playground_enabled: bool | None = Field(default=None, alias="PLAYGROUND_ENABLED")
+    playground_token: str | None = Field(default=None, alias="PLAYGROUND_TOKEN")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    def is_playground_enabled(self) -> bool:
+        if self.playground_enabled is not None:
+            return self.playground_enabled
+        return self.app_env != "production"
 
 
 @lru_cache(maxsize=1)

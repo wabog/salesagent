@@ -16,7 +16,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await application.startup()
-        yield
+        try:
+            yield
+        finally:
+            await application.shutdown()
 
     app = FastAPI(title="Sales Agent", lifespan=lifespan)
     app.state.sales_agent = application

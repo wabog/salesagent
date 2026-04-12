@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from sales_agent.core.db import AgentRunRecord, ContactShadowRecord, ConversationThreadRecord, MessageRecord
@@ -19,26 +20,32 @@ class SqlAlchemyMemoryStore:
             return result.scalar_one_or_none() is not None
 
     async def append_message(self, message: ConversationMessage) -> None:
-        async with self._session_factory() as session:
-            session.add(
-                MessageRecord(
-                    message_id=message.message_id,
-                    conversation_id=message.conversation_id,
-                    phone_number=message.phone_number,
-                    direction=message.direction.value,
-                    text=message.text,
-                    created_at=message.created_at,
-                    metadata_json=message.metadata,
+        for _ in range(2):
+            async with self._session_factory() as session:
+                session.add(
+                    MessageRecord(
+                        message_id=message.message_id,
+                        conversation_id=message.conversation_id,
+                        phone_number=message.phone_number,
+                        direction=message.direction.value,
+                        text=message.text,
+                        created_at=message.created_at,
+                        metadata_json=message.metadata,
+                    )
                 )
-            )
-            thread = await session.get(ConversationThreadRecord, message.conversation_id)
-            if thread is None:
-                thread = ConversationThreadRecord(
-                    conversation_id=message.conversation_id,
-                    phone_number=message.phone_number,
-                )
-                session.add(thread)
-            await session.commit()
+                thread = await session.get(ConversationThreadRecord, message.conversation_id)
+                if thread is None:
+                    thread = ConversationThreadRecord(
+                        conversation_id=message.conversation_id,
+                        phone_number=message.phone_number,
+                    )
+                    session.add(thread)
+                try:
+                    await session.commit()
+                    return
+                except IntegrityError:
+                    await session.rollback()
+        raise RuntimeError("Failed to append message after retry.")
 
     async def get_recent_messages(self, conversation_id: str, limit: int = 8) -> list[ConversationMessage]:
         async with self._session_factory() as session:
@@ -119,24 +126,30 @@ class SqlAlchemyMemoryStore:
         response_text: str,
         tool_results: list[ToolExecutionResult],
     ) -> None:
-        async with self._session_factory() as session:
-            session.add(
-                AgentRunRecord(
-                    run_id=run_id,
-                    conversation_id=event.conversation_id,
-                    message_id=event.message_id,
-                    phone_number=event.phone_number,
-                    intent=intent,
-                    response_text=response_text,
-                    tool_results_json=[result.model_dump(mode="json") for result in tool_results],
+        for _ in range(2):
+            async with self._session_factory() as session:
+                session.add(
+                    AgentRunRecord(
+                        run_id=run_id,
+                        conversation_id=event.conversation_id,
+                        message_id=event.message_id,
+                        phone_number=event.phone_number,
+                        intent=intent,
+                        response_text=response_text,
+                        tool_results_json=[result.model_dump(mode="json") for result in tool_results],
+                    )
                 )
-            )
-            thread = await session.get(ConversationThreadRecord, event.conversation_id)
-            if thread is None:
-                thread = ConversationThreadRecord(
-                    conversation_id=event.conversation_id,
-                    phone_number=event.phone_number,
-                )
-                session.add(thread)
-            thread.last_intent = intent
-            await session.commit()
+                thread = await session.get(ConversationThreadRecord, event.conversation_id)
+                if thread is None:
+                    thread = ConversationThreadRecord(
+                        conversation_id=event.conversation_id,
+                        phone_number=event.phone_number,
+                    )
+                    session.add(thread)
+                thread.last_intent = intent
+                try:
+                    await session.commit()
+                    return
+                except IntegrityError:
+                    await session.rollback()
+        raise RuntimeError("Failed to save run after retry.")

@@ -58,6 +58,14 @@ Esos tests usan la configuración activa del entorno y validan:
 
 Revisa [`.env.example`](/home/gidiom/Wabog/salesAgent/.env.example). Para desarrollo, el servicio funciona con SQLite y un CRM en memoria. Para producción, usa `Postgres` en `DATABASE_URL` y configura `CRM_BACKEND=notion`.
 
+Variables útiles para producción:
+
+- `DATABASE_URL=postgresql+asyncpg://usuario:password@host:5432/sales_agent`
+- `APP_ENV=production`
+- `MESSAGE_BATCH_WINDOW_SECONDS=3` para agrupar ráfagas cortas del usuario antes de responder
+- `PLAYGROUND_ENABLED=false` para no exponer pruebas manuales
+- `PLAYGROUND_ENABLED=true` junto con `PLAYGROUND_TOKEN=un-secreto-largo` si quieres habilitarlo temporalmente
+
 ## Endpoints
 
 - `POST /webhooks/whatsapp/kapso`
@@ -76,6 +84,42 @@ http://127.0.0.1:8000/playground
 
 Ese playground usa el endpoint `POST /chat/local` para hablar con el agente sin pasar por Kapso. Sirve para probar Notion, OpenAI y memoria conversacional local antes de conectar WhatsApp real.
 
+En `production` el playground queda deshabilitado por defecto. Si lo habilitas con `PLAYGROUND_ENABLED=true` y defines `PLAYGROUND_TOKEN`, accede con:
+
+```text
+https://tu-dominio/playground?token=TU_TOKEN
+```
+
+La página reutiliza ese token para llamar a `POST /chat/local`.
+
+## Despliegue en EasyPanel
+
+El repo ya incluye `Dockerfile` para desplegar como servicio web.
+
+Pasos recomendados:
+
+1. Crea un servicio `App` desde Git y apunta al repo.
+2. Usa el `Dockerfile` del proyecto.
+3. Expón el puerto `8000` o mapea el puerto público al `8000` interno.
+4. Define variables de entorno en EasyPanel:
+   - `APP_ENV=production`
+   - `DATABASE_URL=postgresql+asyncpg://...`
+   - `CRM_BACKEND=notion`
+   - `OPENAI_API_KEY=...`
+   - `NOTION_API_KEY=...`
+   - `NOTION_DATA_SOURCE_ID=...`
+   - `KAPSO_PHONE_NUMBER_ID=...`
+   - `KAPSO_API_TOKEN=...`
+   - `WHATSAPP_SEND_ENABLED=false` mientras pruebas
+5. Configura healthcheck contra `GET /healthz`.
+6. Si vas a usar SQLite por alguna razón, monta un volumen persistente; para producción real conviene Postgres.
+
+Notas prácticas:
+
+- No subas `.env` al repo; EasyPanel debe inyectar secretos desde su panel.
+- Si el repo es privado, EasyPanel puede desplegarlo igual usando integración con GitHub/GitLab o un token de acceso.
+- Si publicas el repo, el código del playground será público, pero no los secretos si los mantienes fuera del repo. Lo que sí debes evitar es dejar `/playground` abierto en producción.
+
 ## Regla central del CRM
 
 Cada conversación queda anclada a un solo lead:
@@ -90,10 +134,11 @@ El agente no tiene queries abiertas sobre el CRM. Las actions de negocio se ejec
 ## Flujo
 
 1. Normaliza el payload de WhatsApp.
-2. Aplica idempotencia por `message_id`.
-3. Resuelve el `current_lead` por teléfono o lo crea si no existe.
-4. Carga historial y memorias de esa conversación.
-5. Clasifica intención y planea acciones sobre ese lead únicamente.
-6. Ejecuta tools limitadas al `current_lead`.
-7. Persiste run y mensajes.
-8. Envía respuesta por el canal configurado.
+2. Aplica idempotencia por `message_id` y persiste el inbound.
+3. Agrupa mensajes consecutivos de la misma conversación durante una ventana corta (`MESSAGE_BATCH_WINDOW_SECONDS`).
+4. Cuando se cierra la ventana, revisa si entró algo nuevo antes del commit; si entró, recompone el lote y reprocesa.
+5. Resuelve el `current_lead` por teléfono o lo crea si no existe.
+6. Carga historial y memorias de esa conversación.
+7. Clasifica intención y planea acciones sobre ese lead únicamente.
+8. Ejecuta tools limitadas al `current_lead`.
+9. Persiste el run y envía una sola respuesta para el lote.

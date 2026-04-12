@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -26,13 +26,29 @@ class ChatPayload(BaseModel):
     contact_name: str | None = "Playground User"
 
 
+def _require_playground_access(request: Request, provided_token: str | None = None) -> None:
+    settings = request.app.state.sales_agent.settings
+    if not settings.is_playground_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Playground disabled.",
+        )
+    expected_token = settings.playground_token
+    if expected_token and provided_token != expected_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid playground token.",
+        )
+
+
 @router.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
 
 
 @router.get("/playground", response_class=HTMLResponse)
-async def playground() -> str:
+async def playground(request: Request, token: str | None = None) -> str:
+    _require_playground_access(request, token)
     return """
 <!doctype html>
 <html lang="es">
@@ -141,6 +157,9 @@ async def playground() -> str:
         border: 1px solid var(--border);
         border-bottom-left-radius: 6px;
       }
+      .msg.pending {
+        opacity: 0.72;
+      }
       .meta {
         display: block;
         margin-top: 8px;
@@ -213,6 +232,8 @@ async def playground() -> str:
       </div>
     </div>
     <script>
+      const params = new URLSearchParams(window.location.search);
+      const playgroundToken = params.get("token") || "";
       const chat = document.getElementById("chat");
       const text = document.getElementById("text");
       const phone = document.getElementById("phone");
@@ -230,11 +251,43 @@ async def playground() -> str:
         localStorage.setItem(storeKey, JSON.stringify(messages));
       }
 
+      function nextId(prefix) {
+        if (window.crypto && typeof window.crypto.randomUUID === "function") {
+          return `${prefix}-${window.crypto.randomUUID()}`;
+        }
+        return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      }
+
+      function appendMessage(item) {
+        const messages = loadState();
+        messages.push(item);
+        saveState(messages);
+        render(messages);
+      }
+
+      function updateMessage(messageId, updater) {
+        const messages = loadState();
+        const index = messages.findIndex((item) => item.id === messageId);
+        if (index === -1) return;
+        messages[index] = updater(messages[index]);
+        saveState(messages);
+        render(messages);
+      }
+
+      function removeMessage(messageId) {
+        const messages = loadState().filter((item) => item.id !== messageId);
+        saveState(messages);
+        render(messages);
+      }
+
       function render(messages) {
         chat.innerHTML = "";
         for (const item of messages) {
           const el = document.createElement("div");
           el.className = `msg ${item.role}`;
+          if (item.pending) {
+            el.classList.add("pending");
+          }
           el.textContent = item.text;
           if (item.meta) {
             const meta = document.createElement("span");
@@ -250,31 +303,58 @@ async def playground() -> str:
       async function sendMessage() {
         const value = text.value.trim();
         if (!value) return;
-        const messages = loadState();
-        messages.push({ role: "user", text: value });
-        saveState(messages);
-        render(messages);
+        const requestId = nextId("playground");
+        const replyId = `reply-${requestId}`;
+        appendMessage({ id: `user-${requestId}`, role: "user", text: value });
+        appendMessage({
+          id: replyId,
+          role: "agent",
+          text: "Pensando...",
+          meta: "Procesando mensaje",
+          pending: true,
+        });
         text.value = "";
         status.textContent = "Consultando al agente...";
 
-        const response = await fetch("/chat/local", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: value,
-            phone_number: phone.value.trim() || "3156832405",
-            conversation_id: conversation.value.trim() || "playground-conv"
-          })
-        });
-        const data = await response.json();
-        const lead = data.contact?.full_name || data.contact?.phone_number || "sin lead";
-        const stage = data.contact?.stage || "sin etapa";
-        const tools = (data.tool_results || []).map(item => item.action?.type).filter(Boolean).join(", ") || "sin tools";
-        const meta = `intent=${data.intent} | lead=${lead} | etapa=${stage} | tools=${tools}`;
-        messages.push({ role: "agent", text: data.response_text, meta });
-        saveState(messages);
-        render(messages);
-        status.textContent = response.ok ? "OK" : "Error";
+        try {
+          const response = await fetch("/chat/local", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(playgroundToken ? { "X-Playground-Token": playgroundToken } : {})
+            },
+            body: JSON.stringify({
+              text: value,
+              phone_number: phone.value.trim() || "3156832405",
+              conversation_id: conversation.value.trim() || "playground-conv"
+            })
+          });
+          const data = await response.json();
+          const lead = data.contact?.full_name || data.contact?.phone_number || "sin lead";
+          const stage = data.contact?.stage || "sin etapa";
+          const tools = (data.tool_results || []).map(item => item.action?.type).filter(Boolean).join(", ") || "sin tools";
+          const meta = `intent=${data.intent} | lead=${lead} | etapa=${stage} | tools=${tools}`;
+          if (!data.render_reply) {
+            removeMessage(replyId);
+            status.textContent = response.ok ? "Agrupado con mensajes posteriores" : "Error";
+            return;
+          }
+          updateMessage(replyId, (current) => ({
+            ...current,
+            text: data.response_text || "Sin respuesta",
+            meta,
+            pending: false,
+          }));
+          status.textContent = response.ok ? "OK" : "Error";
+        } catch (error) {
+          updateMessage(replyId, (current) => ({
+            ...current,
+            text: "No se pudo obtener respuesta del agente.",
+            meta: error instanceof Error ? error.message : "Error inesperado",
+            pending: false,
+          }));
+          status.textContent = "Error";
+        }
       }
 
       document.getElementById("send").addEventListener("click", sendMessage);
@@ -300,7 +380,7 @@ async def playground() -> str:
 async def kapso_webhook(request: Request) -> dict:
     payload = await request.json()
     event = normalize_kapso_payload(payload)
-    result = await request.app.state.sales_agent.workflow.run(event)
+    result = await request.app.state.sales_agent.handle_event(event, wait_for_response=False)
     return result.model_dump(mode="json")
 
 
@@ -309,12 +389,17 @@ async def replay(payload: ReplayPayload, request: Request) -> dict:
     event = payload.event
     if event is None:
         event = normalize_kapso_payload(payload.webhook_payload or {})
-    result = await request.app.state.sales_agent.workflow.run(event)
+    result = await request.app.state.sales_agent.handle_event(event, wait_for_response=True)
     return result.model_dump(mode="json")
 
 
 @router.post("/chat/local")
-async def local_chat(payload: ChatPayload, request: Request) -> dict:
+async def local_chat(
+    payload: ChatPayload,
+    request: Request,
+    x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
+) -> dict:
+    _require_playground_access(request, x_playground_token)
     event = InboundMessage(
         message_id=f"local-{uuid4().hex}",
         conversation_id=payload.conversation_id,
@@ -325,5 +410,5 @@ async def local_chat(payload: ChatPayload, request: Request) -> dict:
         provider="local-playground",
         contact_name=payload.contact_name,
     )
-    result = await request.app.state.sales_agent.workflow.run(event)
+    result = await request.app.state.sales_agent.handle_event(event, wait_for_response=True)
     return result.model_dump(mode="json")

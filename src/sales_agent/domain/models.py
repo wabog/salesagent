@@ -95,3 +95,16 @@ class AgentRunResult(BaseModel):
     response_text: str
     tool_results: list[ToolExecutionResult] = Field(default_factory=list)
     contact: CRMContact | None = None
+
+
+class InboundProcessingResult(BaseModel):
+    accepted: bool = True
+    queued: bool = False
+    duplicate: bool = False
+    render_reply: bool = True
+    aggregated_messages: int = 1
+    run_id: str | None = None
+    intent: str | None = None
+    response_text: str = ""
+    tool_results: list[ToolExecutionResult] = Field(default_factory=list)
+    contact: CRMContact | None = None
