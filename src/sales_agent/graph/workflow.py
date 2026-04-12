@@ -102,11 +102,11 @@ class SalesAgentWorkflow:
         contact = await self.crm.find_contact_by_phone(state["event"].phone_number)
         if contact is None:
             shadow = await self.memory.get_contact_shadow(state["event"].phone_number)
-            contact = shadow or await self.crm.create_contact(
+            contact = await self.crm.create_contact(
                 phone_number=state["event"].phone_number,
-                full_name=state["event"].contact_name,
+                full_name=state["event"].contact_name or (shadow.full_name if shadow else None),
             )
-            state["lead_created"] = shadow is None
+            state["lead_created"] = True
         state["current_lead"] = contact
         return state
 
@@ -137,6 +137,14 @@ class SalesAgentWorkflow:
         results: list[ToolExecutionResult] = []
         for action in planning.actions:
             try:
+                if action.type == ActionType.UPDATE_STAGE and not action.args.get("stage"):
+                    inferred_stage = self.planner._infer_stage_from_text(  # noqa: SLF001
+                        state["event"].text,
+                        current_lead.stage if current_lead and current_lead.stage else "Prospecto",
+                        [message["text"] for message in state["recent_messages"]],
+                    )
+                    if inferred_stage:
+                        action = action.model_copy(update={"args": {**action.args, "stage": inferred_stage}})
                 self.policy.validate(action)
                 if action.type == ActionType.UPDATE_STAGE:
                     current_lead = await scoped_tools.update_stage(action.args["stage"])

@@ -33,10 +33,10 @@ class NotionCRMAdapter:
             f"/data_sources/{self._settings.notion_data_source_id}/query",
             json=payload,
         )
-        results = data.get("results", [])
-        if not results:
+        page = self._pick_active_page(data.get("results", []))
+        if page is None:
             return None
-        return self._to_contact(results[0])
+        return self._to_contact(page)
 
     async def create_contact(self, phone_number: str, full_name: str | None = None) -> CRMContact:
         properties = {
@@ -126,3 +126,11 @@ class NotionCRMAdapter:
             stage=stage,
             metadata={"raw_properties": properties},
         )
+
+    @staticmethod
+    def _pick_active_page(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for page in results:
+            if page.get("archived") or page.get("in_trash"):
+                continue
+            return page
+        return None

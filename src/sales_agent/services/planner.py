@@ -54,7 +54,8 @@ class AgentPlanner:
         if self._llm is not None:
             try:
                 result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories)
-                return self._enforce_sales_policy(self._repair_actions(result, text, contact), text, contact)
+                repaired = self._repair_actions(result, text, contact, recent_messages)
+                return self._enforce_sales_policy(repaired, text, contact, recent_messages)
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
         return self._plan_with_rules(text, contact)
@@ -94,7 +95,11 @@ class AgentPlanner:
               Disqualified -> No califica
               Lost -> Perdido
             - Add notes when the user reveals buying intent, objections, current process, or next-step commitments.
+            - APPEND_NOTE entries must be CRM-ready summaries in Spanish, written naturally for a future sales rep.
+            - Notes must capture durable facts and next steps, not copy-paste the user's message.
+            - Prefer 1 to 3 short sentences such as company context, current tool, pain points, urgency, and agreed next step.
             - Create a follow-up when a concrete next step or reminder is needed.
+            - CREATE_FOLLOWUP summaries must be short operational reminders, not the raw user message.
             - Never invent CRM data you do not have.
 
             Contact:
@@ -113,23 +118,41 @@ class AgentPlanner:
         output = await self._llm.ainvoke(prompt)
         return PlanningResult(**output.model_dump())
 
-    def _repair_actions(self, result: PlanningResult, text: str, contact: CRMContact | None) -> PlanningResult:
+    def _repair_actions(
+        self,
+        result: PlanningResult,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+    ) -> PlanningResult:
         current_stage = contact.stage if contact and contact.stage else "Prospecto"
         repaired_actions: list[ProposedAction] = []
         for action in result.actions:
             args = dict(action.args)
             if action.type == ActionType.UPDATE_STAGE and not args.get("stage"):
-                inferred = self._infer_stage_from_text(text, current_stage)
+                inferred = self._infer_stage_from_text(text, current_stage, recent_messages)
                 if inferred:
                     args["stage"] = inferred
-            if action.type == ActionType.APPEND_NOTE and not args.get("note"):
-                args["note"] = text.strip()
-            if action.type == ActionType.CREATE_FOLLOWUP and not args.get("summary"):
-                args["summary"] = text.strip()
+            if action.type == ActionType.APPEND_NOTE:
+                existing_note = str(args.get("note", "")).strip()
+                if not existing_note or self._should_rewrite_note(existing_note, text):
+                    generated_note = self._build_sales_note(text, recent_messages)
+                    if generated_note:
+                        args["note"] = generated_note
+            if action.type == ActionType.CREATE_FOLLOWUP:
+                existing_summary = str(args.get("summary", "")).strip()
+                if not existing_summary or self._should_rewrite_followup_summary(existing_summary, text):
+                    args["summary"] = self._build_followup_summary(text, recent_messages)
             repaired_actions.append(action.model_copy(update={"args": args}))
         return result.model_copy(update={"actions": repaired_actions})
 
-    def _enforce_sales_policy(self, result: PlanningResult, text: str, contact: CRMContact | None) -> PlanningResult:
+    def _enforce_sales_policy(
+        self,
+        result: PlanningResult,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str] | None = None,
+    ) -> PlanningResult:
         lowered = text.lower()
         current_stage = contact.stage if contact and contact.stage else "Prospecto"
         actions = [action.model_copy(deep=True) for action in result.actions]
@@ -139,7 +162,7 @@ class AgentPlanner:
             (index for index, action in enumerate(actions) if action.type == ActionType.UPDATE_STAGE),
             None,
         )
-        inferred_stage = self._infer_stage_from_text(text, current_stage)
+        inferred_stage = self._infer_stage_from_text(text, current_stage, recent_messages or [])
         if inferred_stage and self._should_update_stage(current_stage, inferred_stage):
             stage_action = ProposedAction(
                 type=ActionType.UPDATE_STAGE,
@@ -156,7 +179,7 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.APPEND_NOTE,
                     reason="La política comercial registra el interés o contexto revelado por el lead.",
-                    args={"note": text.strip()},
+                    args={"note": self._build_sales_note(text, recent_messages or [])},
                 )
             )
 
@@ -165,14 +188,34 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
                     reason="La política comercial requiere dejar el siguiente paso explícito.",
-                    args={"summary": text.strip()},
+                    args={"summary": self._build_followup_summary(text, recent_messages or [])},
                 )
             )
 
         return result.model_copy(update={"actions": actions})
 
-    def _infer_stage_from_text(self, text: str, current_stage: str) -> str | None:
+    def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
         lowered = text.lower()
+        recent_lowered = " ".join(message.lower() for message in (recent_messages or [])[-3:])
+        affirmative_reply = lowered.strip() in {
+            "si",
+            "sí",
+            "si claro",
+            "sí claro",
+            "claro",
+            "de una",
+            "dale",
+            "hagámosle",
+            "hagamosle",
+            "ok",
+            "vale",
+            "me sirve",
+        }
+        if affirmative_reply:
+            if any(token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+                return "Demo agendada"
+            if any(token in recent_lowered for token in ("trial", "prueba", "probar", "testear")):
+                return "Prueba / Trial"
         if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
             return "Demo agendada"
         if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
@@ -186,6 +229,11 @@ class AgentPlanner:
         if any(token in lowered for token in ("ya compré", "ya compre", "arranquemos", "vamos a trabajar")):
             return "Cliente"
         if any(token in lowered for token in ("precio", "planes", "cuanto cuesta", "costos")) and current_stage == "Prospecto":
+            return "Primer contacto"
+        if current_stage == "Prospecto" and any(
+            token in lowered
+            for token in ("adquirir", "comprar", "quisiera", "quiero", "me interesa", "interesado", "interesada")
+        ):
             return "Primer contacto"
         return None
 
@@ -219,6 +267,153 @@ class AgentPlanner:
             "abogado",
         )
         return any(token in lowered_text for token in note_signals)
+
+    def _should_rewrite_note(self, note: str, text: str) -> bool:
+        normalized_note = self._normalize_text(note)
+        normalized_text = self._normalize_text(text)
+        if not normalized_note:
+            return True
+        if normalized_note == normalized_text:
+            return True
+        if normalized_text and normalized_text in normalized_note and len(normalized_note) <= len(normalized_text) + 40:
+            return True
+        return normalized_note.startswith(
+            (
+                "solicitud de demo",
+                "interés comercial en pricing",
+                "interes comercial en pricing",
+                "interés en trial",
+                "interes en trial",
+            )
+        )
+
+    def _should_rewrite_followup_summary(self, summary: str, text: str) -> bool:
+        normalized_summary = self._normalize_text(summary)
+        normalized_text = self._normalize_text(text)
+        if not normalized_summary:
+            return True
+        if normalized_summary == normalized_text:
+            return True
+        return normalized_summary.startswith(("coordinar demo para lead actual", "contexto:"))
+
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip().lower())
+
+    def _build_sales_note(self, text: str, recent_messages: list[str]) -> str:
+        lowered = text.lower()
+        recent_lowered = " ".join(message.lower() for message in recent_messages[-3:])
+        sentences: list[str] = []
+
+        firm_name_match = re.search(
+            r"(?:despacho|firma)(?:\s+(?:llamado|llamada|que se llama|se llama))?\s+([A-Za-z0-9][A-Za-z0-9_-]*)",
+            text,
+            re.IGNORECASE,
+        )
+        lawyers_match = re.search(r"(\d+)\s+abogad", lowered)
+        processes_match = re.search(r"(\d+)\s+proces", lowered)
+        current_tool = self._extract_current_tool(text)
+        if current_tool is None:
+            for previous_message in reversed(recent_messages[-4:]):
+                current_tool = self._extract_current_tool(previous_message)
+                if current_tool:
+                    break
+
+        context_bits: list[str] = []
+        if firm_name_match:
+            context_bits.append(f"Despacho {firm_name_match.group(1)}")
+        elif "despacho" in lowered or "firma" in lowered:
+            context_bits.append("Despacho del lead")
+        if lawyers_match:
+            context_bits.append(f"{lawyers_match.group(1)} abogados")
+        if processes_match:
+            context_bits.append(f"aprox. {processes_match.group(1)} procesos al mes")
+        if context_bits:
+            if len(context_bits) == 1:
+                sentences.append(f"{context_bits[0]}.")
+            else:
+                sentences.append(f"{context_bits[0]} con {', '.join(context_bits[1:])}.")
+
+        tool_and_pain_parts: list[str] = []
+        if current_tool:
+            tool_and_pain_parts.append(f"Hoy usan {current_tool}")
+        if any(token in lowered for token in ("problema", "problemas", "seguimiento", "llevar", "llevando")) and "seguimiento" in lowered:
+            tool_and_pain_parts.append("reportan dolor en el seguimiento de procesos")
+        if any(token in lowered for token in ("no notifica", "notifica bien", "notificaciones", "notificar")):
+            tool_and_pain_parts.append("indican fallas de notificaciones")
+        if "whatsapp" in lowered and any(token in lowered for token in ("notifica", "notificaciones", "notificar")):
+            tool_and_pain_parts.append("quieren recibir alertas por WhatsApp")
+        if tool_and_pain_parts:
+            sentences.append(self._capitalize_first(self._join_note_parts(tool_and_pain_parts)) + ".")
+
+        commercial_parts: list[str] = []
+        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+            if any(token in lowered for token in ("si", "sí", "me parecería", "me pareceria", "claro", "vale", "ok", "de una")):
+                commercial_parts.append("Confirman disposición para agendar una demo")
+            else:
+                commercial_parts.append("Muestran interés en agendar una demo")
+        elif lowered.strip() in {"si", "sí", "si claro", "sí claro", "claro", "de una", "dale", "ok", "vale", "me sirve"} and any(
+            token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")
+        ):
+            commercial_parts.append("Confirman disposición para agendar una demo")
+        if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
+            commercial_parts.append("Quieren evaluar Wabog en prueba o trial")
+        if any(token in lowered for token in ("precio", "planes", "cotización", "cotizacion", "cuanto cuesta", "costos")):
+            commercial_parts.append("Consultan por pricing o propuesta comercial")
+        if any(token in lowered for token in ("lo antes posible", "pronto", "urgente", "rápido", "rapido")):
+            commercial_parts.append("Buscan avanzar pronto")
+        if commercial_parts:
+            sentences.append(self._capitalize_first(self._join_note_parts(commercial_parts)) + ".")
+
+        if not sentences:
+            return "Lead comparte contexto comercial relevante y conviene profundizar en necesidades y siguiente paso."
+        return " ".join(sentences[:3])
+
+    def _build_followup_summary(self, text: str, recent_messages: list[str]) -> str:
+        lowered = text.lower()
+        recent_lowered = " ".join(message.lower() for message in recent_messages[-3:])
+        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+            return "Coordinar fecha y hora para demo comercial."
+        if lowered.strip() in {"si", "sí", "si claro", "sí claro", "claro", "de una", "dale", "ok", "vale", "me sirve"} and any(
+            token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")
+        ):
+            return "Confirmar fecha y hora para la demo acordada."
+        if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
+            return "Definir siguiente paso para trial o prueba guiada."
+        if any(token in lowered for token in ("precio", "planes", "cotización", "cotizacion", "propuesta")):
+            return "Responder pricing o enviar propuesta comercial."
+        return "Dar seguimiento comercial al lead."
+
+    def _extract_current_tool(self, text: str) -> str | None:
+        patterns = (
+            r"(?:herramienta|tool|app)\s+llamada\s+([A-Za-z0-9][A-Za-z0-9_-]*)",
+            r"(?:usamos|usan|actualmente usan|hoy usan)\s+([A-Za-z0-9][A-Za-z0-9_-]*)",
+        )
+        for pattern in patterns:
+            if match := re.search(pattern, text, re.IGNORECASE):
+                return match.group(1)[0].upper() + match.group(1)[1:]
+        return None
+
+    def _join_note_parts(self, parts: list[str]) -> str:
+        unique_parts: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            normalized = self._normalize_text(part)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_parts.append(part)
+        if not unique_parts:
+            return ""
+        if len(unique_parts) == 1:
+            return unique_parts[0]
+        if len(unique_parts) == 2:
+            return f"{unique_parts[0]} y {unique_parts[1]}"
+        return ", ".join(unique_parts[:-1]) + f" y {unique_parts[-1]}"
+
+    def _capitalize_first(self, text: str) -> str:
+        if not text:
+            return text
+        return text[0].upper() + text[1:]
 
     def _should_create_followup(self, lowered_text: str) -> bool:
         followup_signals = (
@@ -311,7 +506,7 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.APPEND_NOTE,
                     reason="El lead preguntó por precio o planes.",
-                    args={"note": f"Interés comercial en pricing/planes: {text.strip()}"},
+                    args={"note": self._build_sales_note(text, [])},
                 )
             )
             response_lines.append(
@@ -328,14 +523,14 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.APPEND_NOTE,
                     reason="El lead pidió demo o reunión.",
-                    args={"note": f"Solicitud de demo/reunión: {text.strip()}"},
+                    args={"note": self._build_sales_note(text, [])},
                 )
             )
             actions.append(
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
                     reason="Hay que dar siguiente paso comercial después de pedir demo.",
-                    args={"summary": f"Coordinar demo para lead actual. Contexto: {text.strip()}"},
+                    args={"summary": self._build_followup_summary(text, [])},
                 )
             )
             response_lines.append(
@@ -351,7 +546,7 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.APPEND_NOTE,
                     reason="El lead expresó interés en trial.",
-                    args={"note": f"Interés en trial/prueba: {text.strip()}"},
+                    args={"note": self._build_sales_note(text, [])},
                 )
             )
             response_lines.append(

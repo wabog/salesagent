@@ -7,7 +7,8 @@ from sales_agent.adapters.crm_memory import InMemoryCRMAdapter
 from sales_agent.adapters.memory_sql import SqlAlchemyMemoryStore
 from sales_agent.core.config import Settings
 from sales_agent.core.db import build_engine, build_session_factory, init_db
-from sales_agent.domain.models import InboundMessage
+from sales_agent.domain.models import CRMContact, InboundMessage
+from sales_agent.domain.models import ActionType, PlanningResult, ProposedAction
 from sales_agent.graph.workflow import SalesAgentWorkflow
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
@@ -96,3 +97,86 @@ async def test_existing_lead_is_reused_without_creation_side_effect():
     assert contact is not None
     assert contact.external_id == existing.external_id
     assert not result.response_text.startswith("Ya registré este número como lead en el CRM.")
+
+
+@pytest.mark.asyncio
+async def test_workflow_does_not_reuse_stale_shadow_when_crm_contact_is_missing():
+    workflow, crm, memory = await build_workflow()
+    await memory.remember_contact(
+        CRMContact(
+            external_id="stale-shadow-id",
+            phone_number="573001230000",
+            full_name="Lead Stale",
+            stage="Demo agendada",
+        )
+    )
+
+    event = InboundMessage(
+        message_id="stale-shadow-1",
+        conversation_id="conv-shadow",
+        phone_number="573001230000",
+        text="hola",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+        contact_name="Lead Nuevo",
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("573001230000")
+
+    assert result.duplicate is False
+    assert contact is not None
+    assert contact.external_id != "stale-shadow-id"
+    assert result.contact is not None
+    assert result.contact.external_id == contact.external_id
+
+
+@pytest.mark.asyncio
+async def test_workflow_repairs_missing_stage_during_tool_execution():
+    engine = build_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    session_factory = build_session_factory(engine)
+    memory = SqlAlchemyMemoryStore(session_factory)
+    crm = InMemoryCRMAdapter()
+
+    class StubPlanner:
+        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
+            return PlanningResult(
+                intent="demo_confirmation",
+                confidence=0.8,
+                response_text="Perfecto, agendemos.",
+                actions=[
+                    ProposedAction(
+                        type=ActionType.UPDATE_STAGE,
+                        reason="El lead confirmó que quiere avanzar.",
+                        args={},
+                    )
+                ],
+            )
+
+        def _infer_stage_from_text(self, text, current_stage, recent_messages):  # noqa: ANN001
+            return "Demo agendada"
+
+    workflow = SalesAgentWorkflow(
+        crm_adapter=crm,
+        memory_store=memory,
+        channel_adapter=ConsoleChannelAdapter(),
+        planner=StubPlanner(),
+        policy=ToolExecutionPolicy(),
+    )
+
+    event = InboundMessage(
+        message_id="repair-stage-1",
+        conversation_id="conv-repair-stage",
+        phone_number="573001240000",
+        text="si claro",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("573001240000")
+
+    assert contact is not None
+    assert contact.stage == "Demo agendada"
+    assert result.tool_results[0].success is True
