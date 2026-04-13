@@ -31,7 +31,7 @@ class KapsoWhatsAppAdapter:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 url,
-                headers={"Authorization": f"Bearer {self._settings.kapso_api_token}"},
+                headers={"X-API-Key": self._settings.kapso_api_token},
                 json=body,
             )
             response.raise_for_status()
