@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from sales_agent.adapters.whatsapp import normalize_kapso_payload
+from sales_agent.adapters.whatsapp import KapsoPayloadError, normalize_kapso_payload
 from sales_agent.domain.models import InboundMessage
 
 
@@ -379,7 +379,18 @@ async def playground(request: Request, token: str | None = None) -> str:
 @router.post("/webhooks/whatsapp/kapso")
 async def kapso_webhook(request: Request) -> dict:
     payload = await request.json()
-    event = normalize_kapso_payload(payload)
+    try:
+        event = normalize_kapso_payload(payload)
+    except KapsoPayloadError as exc:
+        return {
+            "accepted": False,
+            "queued": False,
+            "duplicate": False,
+            "render_reply": False,
+            "aggregated_messages": 0,
+            "response_text": "",
+            "ignored_reason": str(exc),
+        }
     result = await request.app.state.sales_agent.handle_event(event, wait_for_response=False)
     return result.model_dump(mode="json")
 

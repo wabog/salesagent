@@ -37,6 +37,37 @@ async def test_healthz_and_webhook_flow():
 
 
 @pytest.mark.asyncio
+async def test_webhook_ignores_non_message_events():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+    payload = {
+        "event": "message.status",
+        "data": {
+            "message": {
+                "id": "msg-status",
+                "timestamp": "1775704462",
+            }
+        },
+    }
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            webhook = await client.post("/webhooks/whatsapp/kapso", json=payload)
+
+    assert webhook.status_code == 200
+    assert webhook.json()["accepted"] is False
+    assert webhook.json()["render_reply"] is False
+    assert "text content" in webhook.json()["ignored_reason"]
+
+
+@pytest.mark.asyncio
 async def test_local_chat_playground_flow():
     app = create_app(
         Settings(
