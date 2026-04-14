@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from sales_agent.domain.phones import normalize_phone_number
 
 
 def utc_now() -> datetime:
@@ -38,6 +40,11 @@ class InboundMessage(BaseModel):
     provider: str = "kapso"
     contact_name: str | None = None
 
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        return normalize_phone_number(value)
+
 
 class OutboundMessage(BaseModel):
     conversation_id: str
@@ -45,6 +52,11 @@ class OutboundMessage(BaseModel):
     text: str
     channel: Channel = Channel.WHATSAPP
     provider: str = "kapso"
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        return normalize_phone_number(value)
 
 
 class CRMContact(BaseModel):
@@ -56,6 +68,11 @@ class CRMContact(BaseModel):
     notes: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        return normalize_phone_number(value)
+
 
 class ConversationMessage(BaseModel):
     message_id: str
@@ -65,6 +82,11 @@ class ConversationMessage(BaseModel):
     text: str
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        return normalize_phone_number(value)
 
 
 class ProposedAction(BaseModel):

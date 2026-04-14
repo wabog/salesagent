@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from sales_agent.core.config import Settings
+from sales_agent.domain.phones import phone_to_provider_digits
 from sales_agent.domain.models import OutboundMessage
 
 
@@ -24,7 +25,10 @@ class KapsoWhatsAppAdapter:
         body = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
-            "to": message.phone_number,
+            "to": phone_to_provider_digits(
+                message.phone_number,
+                default_country_code=self._settings.phone_default_country_code,
+            ),
             "type": "text",
             "text": {"body": message.text},
         }

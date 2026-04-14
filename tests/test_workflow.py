@@ -43,7 +43,7 @@ async def test_workflow_creates_contact_and_updates_stage():
     )
 
     result = await workflow.run(event)
-    contact = await crm.find_contact_by_phone("573001112233")
+    contact = await crm.find_contact_by_phone("+573001112233")
     recent = await memory.get_recent_messages("conv-1", limit=10)
 
     assert result.duplicate is False
@@ -91,7 +91,7 @@ async def test_existing_lead_is_reused_without_creation_side_effect():
     )
 
     result = await workflow.run(event)
-    contact = await crm.find_contact_by_phone("573009998877")
+    contact = await crm.find_contact_by_phone("+573009998877")
 
     assert result.duplicate is False
     assert contact is not None
@@ -122,7 +122,7 @@ async def test_workflow_does_not_reuse_stale_shadow_when_crm_contact_is_missing(
     )
 
     result = await workflow.run(event)
-    contact = await crm.find_contact_by_phone("573001230000")
+    contact = await crm.find_contact_by_phone("+573001230000")
 
     assert result.duplicate is False
     assert contact is not None
@@ -175,7 +175,7 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
     )
 
     result = await workflow.run(event)
-    contact = await crm.find_contact_by_phone("573001240000")
+    contact = await crm.find_contact_by_phone("+573001240000")
 
     assert contact is not None
     assert contact.stage == "Demo agendada"

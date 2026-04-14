@@ -10,7 +10,7 @@ def test_normalize_kapso_payload():
     payload = json.loads(Path("fixtures/kapso_webhook.json").read_text())
     event = normalize_kapso_payload(payload)
 
-    assert event.phone_number == "573016803866"
+    assert event.phone_number == "+573016803866"
     assert event.conversation_id == "52db4929-5965-45d1-bb4a-b225ec6ad8b8"
     assert event.text == "hola puedes revisar notion dime que personas hay en el pipeline"
     assert event.provider == "kapso"
@@ -38,7 +38,7 @@ def test_normalize_kapso_payload_from_data_wrapper():
 
     assert event.message_id == "msg-123"
     assert event.conversation_id == "conv-123"
-    assert event.phone_number == "573001112233"
+    assert event.phone_number == "+573001112233"
     assert event.text == "hola desde data"
     assert event.contact_name == "Fabian"
 

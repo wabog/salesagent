@@ -12,7 +12,7 @@ async def test_in_memory_crm_lifecycle():
     noted = await crm.append_note(created.external_id, "Pidió una demo")
     followup = await crm.create_followup(created.external_id, "Enviar propuesta mañana")
 
-    assert created.phone_number == "573001112233"
+    assert created.phone_number == "+573001112233"
     assert updated.stage == "Qualified"
     assert noted.notes[-1] == "Pidió una demo"
     assert followup["summary"] == "Enviar propuesta mañana"

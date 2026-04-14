@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from sales_agent.domain.phones import normalize_phone_number
 from sales_agent.domain.models import CRMContact
 
 
@@ -12,9 +13,10 @@ class InMemoryCRMAdapter:
         self.followups: list[dict] = []
 
     async def find_contact_by_phone(self, phone_number: str) -> CRMContact | None:
-        return self._contacts_by_phone.get(phone_number)
+        return self._contacts_by_phone.get(normalize_phone_number(phone_number))
 
     async def create_contact(self, phone_number: str, full_name: str | None = None) -> CRMContact:
+        phone_number = normalize_phone_number(phone_number)
         existing = self._contacts_by_phone.get(phone_number)
         if existing:
             return existing

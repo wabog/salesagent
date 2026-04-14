@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     message_batch_window_seconds: float = Field(default=3.0, alias="MESSAGE_BATCH_WINDOW_SECONDS")
     playground_enabled: bool | None = Field(default=None, alias="PLAYGROUND_ENABLED")
     playground_token: str | None = Field(default=None, alias="PLAYGROUND_TOKEN")
+    phone_default_country_code: str = Field(default="57", alias="PHONE_DEFAULT_COUNTRY_CODE")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

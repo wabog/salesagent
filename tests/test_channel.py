@@ -50,7 +50,7 @@ async def test_kapso_adapter_uses_x_api_key(monkeypatch):
     result = await adapter.send_text(
         OutboundMessage(
             conversation_id="conv-1",
-            phone_number="573001112233",
+            phone_number="+57 300 1112233",
             text="hola",
         )
     )

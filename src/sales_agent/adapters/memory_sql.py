@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from sales_agent.core.db import AgentRunRecord, ContactShadowRecord, ConversationThreadRecord, MessageRecord
+from sales_agent.domain.phones import normalize_phone_number
 from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, ToolExecutionResult
 
 
@@ -90,6 +91,7 @@ class SqlAlchemyMemoryStore:
             await session.commit()
 
     async def get_contact_shadow(self, phone_number: str) -> CRMContact | None:
+        phone_number = normalize_phone_number(phone_number)
         async with self._session_factory() as session:
             record = await session.get(ContactShadowRecord, phone_number)
             if record is None:
