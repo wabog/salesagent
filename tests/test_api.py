@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from sales_agent.api.app import create_app
 from sales_agent.core.config import Settings
-from sales_agent.domain.models import Direction
+from sales_agent.domain.models import ConversationMessage, Direction, InboundMessage
 
 
 @pytest.mark.asyncio
@@ -226,3 +227,54 @@ async def test_playground_prompt_config_can_save_and_publish_draft():
     assert published_before.json()["active_business_prompt"] != "Nuevo brief comercial para playground."
     assert published.status_code == 200
     assert published.json()["published_business_prompt"] == "Nuevo brief comercial para playground."
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_reuses_recent_messages_from_same_phone_across_conversations():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        memory_store = app.state.sales_agent.memory_store
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="prev-in-1",
+                conversation_id="conv-old",
+                phone_number="3156832405",
+                direction=Direction.INBOUND,
+                text="Necesito revisar una propuesta de Wabog.",
+            )
+        )
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="prev-out-1",
+                conversation_id="conv-old",
+                phone_number="3156832405",
+                direction=Direction.OUTBOUND,
+                text="Perfecto, te envio la propuesta y manana hacemos seguimiento.",
+            )
+        )
+
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="new-conv-1",
+                    conversation_id="conv-new",
+                    phone_number="3156832405",
+                    text="listo",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                )
+            ]
+        )
+
+    recent_texts = [message.text for message in prepared.recent_messages]
+    assert "Necesito revisar una propuesta de Wabog." in recent_texts
+    assert "Perfecto, te envio la propuesta y manana hacemos seguimiento." in recent_texts

@@ -18,6 +18,28 @@ from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
 
 
+def _merge_unique_messages(*message_groups: list[ConversationMessage], limit: int) -> list[ConversationMessage]:
+    deduped: dict[str, ConversationMessage] = {}
+    for group in message_groups:
+        for message in group:
+            deduped[message.message_id] = message
+    merged = sorted(deduped.values(), key=lambda item: item.created_at)
+    return merged[-limit:]
+
+
+def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in text_groups:
+        for text in group:
+            normalized = text.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged[-limit:]
+
+
 class SalesAgentWorkflow:
     def __init__(self, crm_adapter, memory_store, channel_adapter, planner: AgentPlanner, policy: ToolExecutionPolicy):
         self.crm = crm_adapter
@@ -111,8 +133,14 @@ class SalesAgentWorkflow:
         return state
 
     async def _load_conversation_context(self, state: AgentState) -> AgentState:
-        recent = await self.memory.get_recent_messages(state["event"].conversation_id)
-        memories = await self.memory.search_memories(state["event"].conversation_id, state["event"].text)
+        conversation_recent = await self.memory.get_recent_messages(state["event"].conversation_id)
+        lead_recent = await self.memory.get_recent_messages_by_phone(state["event"].phone_number)
+        recent = _merge_unique_messages(conversation_recent, lead_recent, limit=12)
+        memories = _merge_unique_texts(
+            await self.memory.search_memories(state["event"].conversation_id, state["event"].text),
+            await self.memory.search_memories_by_phone(state["event"].phone_number, state["event"].text),
+            limit=6,
+        )
         state["recent_messages"] = [message.model_dump(mode="json") for message in recent]
         state["semantic_memories"] = memories
         return state

@@ -265,3 +265,4 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
     assert contact is not None
     assert contact.stage == "Demo agendada"
     assert result.tool_results[0].success is True
+

@@ -33,6 +33,28 @@ from sales_agent.services.policy import ToolExecutionPolicy
 from sales_agent.services.prompt_store import PromptConfigStore
 
 
+def _merge_unique_messages(*message_groups: list[ConversationMessage], limit: int) -> list[ConversationMessage]:
+    deduped: dict[str, ConversationMessage] = {}
+    for group in message_groups:
+        for message in group:
+            deduped[message.message_id] = message
+    merged = sorted(deduped.values(), key=lambda item: item.created_at)
+    return merged[-limit:]
+
+
+def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in text_groups:
+        for text in group:
+            normalized = text.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged[-limit:]
+
+
 @dataclass
 class PreparedBatchRun:
     run_id: str
@@ -109,9 +131,16 @@ class SalesAgentApplication:
             )
             lead_created = True
 
-        recent_messages = await self.memory_store.get_recent_messages(anchor_event.conversation_id, limit=12)
-        recent_messages = [message for message in recent_messages if message.message_id not in batch_message_ids]
-        semantic_memories = await self.memory_store.search_memories(anchor_event.conversation_id, combined_text)
+        conversation_recent = await self.memory_store.get_recent_messages(anchor_event.conversation_id, limit=12)
+        conversation_recent = [message for message in conversation_recent if message.message_id not in batch_message_ids]
+        lead_recent = await self.memory_store.get_recent_messages_by_phone(anchor_event.phone_number, limit=12)
+        lead_recent = [message for message in lead_recent if message.message_id not in batch_message_ids]
+        recent_messages = _merge_unique_messages(conversation_recent, lead_recent, limit=12)
+        semantic_memories = _merge_unique_texts(
+            await self.memory_store.search_memories(anchor_event.conversation_id, combined_text),
+            await self.memory_store.search_memories_by_phone(anchor_event.phone_number, combined_text),
+            limit=6,
+        )
         planning = await self.workflow.planner.plan(
             text=combined_text,
             contact=contact,

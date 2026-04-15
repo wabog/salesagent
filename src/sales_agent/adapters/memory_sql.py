@@ -73,6 +73,30 @@ class SqlAlchemyMemoryStore:
                 for item in items
             ]
 
+    async def get_recent_messages_by_phone(self, phone_number: str, limit: int = 8) -> list[ConversationMessage]:
+        phone_number = normalize_phone_number(phone_number)
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(MessageRecord)
+                .where(MessageRecord.phone_number == phone_number)
+                .order_by(desc(MessageRecord.created_at))
+                .limit(limit)
+            )
+            items = list(result.scalars())
+            items.reverse()
+            return [
+                ConversationMessage(
+                    message_id=item.message_id,
+                    conversation_id=item.conversation_id,
+                    phone_number=item.phone_number,
+                    direction=item.direction,
+                    text=item.text,
+                    created_at=item.created_at,
+                    metadata=item.metadata_json,
+                )
+                for item in items
+            ]
+
     async def remember_contact(self, contact: CRMContact) -> None:
         async with self._session_factory() as session:
             existing = await session.get(ContactShadowRecord, contact.phone_number)
@@ -126,6 +150,20 @@ class SqlAlchemyMemoryStore:
     async def search_memories(self, conversation_id: str, query: str, limit: int = 3) -> list[str]:
         query_terms = {term.lower() for term in query.split() if term.strip()}
         messages = await self.get_recent_messages(conversation_id, limit=20)
+        scored: list[tuple[int, str]] = []
+        for item in messages:
+            text = item.text.strip()
+            if not text:
+                continue
+            score = sum(1 for term in query_terms if term in text.lower())
+            if score:
+                scored.append((score, text))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [text for _, text in scored[:limit]]
+
+    async def search_memories_by_phone(self, phone_number: str, query: str, limit: int = 3) -> list[str]:
+        query_terms = {term.lower() for term in query.split() if term.strip()}
+        messages = await self.get_recent_messages_by_phone(phone_number, limit=20)
         scored: list[tuple[int, str]] = []
         for item in messages:
             text = item.text.strip()
