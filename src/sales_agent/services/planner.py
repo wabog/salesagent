@@ -8,8 +8,9 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from sales_agent.core.config import Settings
-from sales_agent.domain.models import CRMContact, PlanningResult, ProposedAction
 from sales_agent.domain.models import ActionType
+from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
+from sales_agent.services.prompt_store import DEFAULT_BUSINESS_PROMPT
 
 
 class PlannerOutput(BaseModel):
@@ -34,8 +35,9 @@ class AgentPlanner:
         "No califica": -1,
     }
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, prompt_store=None) -> None:
         self._settings = settings
+        self._prompt_store = prompt_store
         self._llm = None
         if settings.openai_api_key:
             self._llm = ChatOpenAI(
@@ -50,10 +52,11 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str],
         semantic_memories: list[str],
+        prompt_mode: PromptMode = PromptMode.PUBLISHED,
     ) -> PlanningResult:
         if self._llm is not None:
             try:
-                result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories)
+                result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories, prompt_mode)
                 repaired = self._repair_actions(result, text, contact, recent_messages)
                 return self._enforce_sales_policy(repaired, text, contact, recent_messages)
             except OpenAIError:
@@ -66,24 +69,55 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str],
         semantic_memories: list[str],
+        prompt_mode: PromptMode,
     ) -> PlanningResult:
-        prompt = dedent(
+        business_prompt = DEFAULT_BUSINESS_PROMPT
+        if self._prompt_store is not None:
+            business_prompt = await self._prompt_store.get_business_prompt(prompt_mode)
+        prompt = self._compose_llm_prompt(
+            business_prompt=business_prompt,
+            contact_json=contact.model_dump_json(indent=2) if contact else "None",
+            recent_messages=str(recent_messages),
+            semantic_memories=str(semantic_memories),
+            text=text,
+        )
+        output = await self._llm.ainvoke(prompt)
+        return PlanningResult(**output.model_dump())
+
+    def get_prompt_scaffold(self) -> str:
+        return self._compose_llm_prompt(
+            business_prompt="{{BUSINESS_PROMPT}}",
+            contact_json="{{CONTACT}}",
+            recent_messages="{{RECENT_MESSAGES}}",
+            semantic_memories="{{SEMANTIC_MEMORIES}}",
+            text="{{USER_MESSAGE}}",
+        )
+
+    def _compose_llm_prompt(
+        self,
+        *,
+        business_prompt: str,
+        contact_json: str,
+        recent_messages: str,
+        semantic_memories: str,
+        text: str,
+    ) -> str:
+        return dedent(
             f"""
             You are a senior inbound sales agent for Wabog.com.
-            Wabog sells software and operational tooling for lawyers, law firms, and legal teams.
             Your job is to qualify interest, move the lead to the correct pipeline stage, capture commercial notes,
             propose demos or trials when appropriate, and push the conversation toward the next concrete step.
+
+            Commercial brief:
+            {business_prompt}
 
             The orchestrator has already resolved the current lead from the sender phone number.
             You can only act on that current lead. Never assume access to other CRM records.
             Decide the user intent, whether to reply, and which actions to take on the current lead.
 
             Sales rules:
-            - Be concise, warm, and operational.
-            - Always answer as a commercial rep for Wabog.
-            - If the user shows interest, qualify pain, process volume, current workflow, and buying context.
-            - If the user asks for price, demo, trial, implementation, integrations, or wants to know how it works,
-              move the lead forward in the pipeline when justified.
+            - If the user explicitly shares or corrects contact data for the current lead, use UPDATE_CONTACT_FIELDS.
+            - UPDATE_CONTACT_FIELDS can persist `full_name` and `email` for the current lead.
             - Use only these stage transitions when justified by the message:
               Prospecto -> Primer contacto
               Primer contacto -> Demo agendada
@@ -103,7 +137,7 @@ class AgentPlanner:
             - Never invent CRM data you do not have.
 
             Contact:
-            {contact.model_dump_json(indent=2) if contact else "None"}
+            {contact_json}
 
             Recent messages:
             {recent_messages}
@@ -115,8 +149,6 @@ class AgentPlanner:
             {text}
             """
         ).strip()
-        output = await self._llm.ainvoke(prompt)
-        return PlanningResult(**output.model_dump())
 
     def _repair_actions(
         self,
@@ -133,6 +165,20 @@ class AgentPlanner:
                 inferred = self._infer_stage_from_text(text, current_stage, recent_messages)
                 if inferred:
                     args["stage"] = inferred
+            if action.type == ActionType.UPDATE_CONTACT_FIELDS:
+                fields = args.get("fields")
+                normalized_fields = dict(fields) if isinstance(fields, dict) else {}
+                inferred_email = self._extract_email(text)
+                inferred_name = self._extract_explicit_name(text)
+                if inferred_email and not normalized_fields.get("email"):
+                    normalized_fields["email"] = inferred_email
+                if inferred_name and not normalized_fields.get("full_name"):
+                    normalized_fields["full_name"] = inferred_name
+                args["fields"] = {
+                    key: str(value).strip()
+                    for key, value in normalized_fields.items()
+                    if key in {"email", "full_name"} and str(value).strip()
+                }
             if action.type == ActionType.APPEND_NOTE:
                 existing_note = str(args.get("note", "")).strip()
                 if not existing_note or self._should_rewrite_note(existing_note, text):
@@ -454,6 +500,31 @@ class AgentPlanner:
             intent = "update_stage"
             confidence = max(confidence, 0.82)
 
+        explicit_email = self._extract_email(text)
+        explicit_name = self._extract_explicit_name(text)
+        contact_fields: dict[str, str] = {}
+        current_email = (contact.email or "").strip() if contact else ""
+        current_name = (contact.full_name or "").strip() if contact else ""
+        if explicit_email and explicit_email != current_email:
+            contact_fields["email"] = explicit_email
+        if explicit_name and explicit_name != current_name:
+            contact_fields["full_name"] = explicit_name
+        if contact_fields:
+            actions.append(
+                ProposedAction(
+                    type=ActionType.UPDATE_CONTACT_FIELDS,
+                    reason="El lead compartió datos de contacto explícitos.",
+                    args={"fields": contact_fields},
+                )
+            )
+            confidence = max(confidence, 0.78)
+            if set(contact_fields) == {"email", "full_name"}:
+                response_lines.append("Perfecto, ya tengo tu nombre y tu correo para seguir con la conversación.")
+            elif "email" in contact_fields:
+                response_lines.append("Perfecto, ya tengo tu correo de contacto.")
+            elif "full_name" in contact_fields:
+                response_lines.append("Perfecto, ya tengo tu nombre para continuar.")
+
         if match := re.search(r"etapa(?:\s+a)?\s+([a-zA-ZáéíóúÁÉÍÓÚ ]+)", lowered):
             stage = match.group(1).strip().title()
             add_stage_change(stage, "El mensaje pide un cambio de etapa.")
@@ -579,3 +650,27 @@ class AgentPlanner:
             actions=actions,
             should_reply=True,
         )
+
+    def _extract_email(self, text: str) -> str | None:
+        match = re.search(r"\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b", text, re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1).strip().lower()
+
+    def _extract_explicit_name(self, text: str) -> str | None:
+        patterns = (
+            r"\bmi nombre es\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ' -]{1,60}?)(?=\s+(?:y\s+(?:mi\s+)?correo)\b|[,.!?]|\n|$)",
+            r"\bme llamo\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ' -]{1,60}?)(?=\s+(?:y\s+(?:mi\s+)?correo)\b|[,.!?]|\n|$)",
+        )
+        for pattern in patterns:
+            if not (match := re.search(pattern, text, re.IGNORECASE)):
+                continue
+            candidate = re.split(r"[,.!?\n]", match.group(1).strip(), maxsplit=1)[0].strip(" -")
+            candidate = re.sub(r"\s+", " ", candidate)
+            if not candidate:
+                return None
+            parts = candidate.split(" ")
+            if len(parts) > 5:
+                return None
+            return " ".join(part.capitalize() for part in parts)
+        return None

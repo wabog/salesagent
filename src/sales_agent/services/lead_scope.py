@@ -15,6 +15,10 @@ class LeadScopedCRMTools:
         self.current_lead = await self.crm.change_stage(self.current_lead.external_id, stage)
         return self.current_lead
 
+    async def update_fields(self, fields: dict) -> CRMContact:
+        self.current_lead = await self.crm.update_contact_fields(self.current_lead.external_id, fields)
+        return self.current_lead
+
     async def add_note(self, note: str) -> CRMContact:
         self.current_lead = await self.crm.append_note(self.current_lead.external_id, note)
         return self.current_lead

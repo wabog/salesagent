@@ -22,6 +22,7 @@ from sales_agent.domain.models import (
     InboundProcessingResult,
     OutboundMessage,
     PlanningResult,
+    PromptMode,
     ToolExecutionResult,
 )
 from sales_agent.graph.workflow import SalesAgentWorkflow
@@ -29,6 +30,7 @@ from sales_agent.services.inbound_processor import DebouncedInboundProcessor
 from sales_agent.services.lead_scope import LeadScopedCRMTools
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
+from sales_agent.services.prompt_store import PromptConfigStore
 
 
 @dataclass
@@ -48,6 +50,7 @@ class SalesAgentApplication:
         self.engine = build_engine(settings.database_url)
         self.session_factory: async_sessionmaker[AsyncSession] = build_session_factory(self.engine)
         self.memory_store = SqlAlchemyMemoryStore(self.session_factory)
+        self.prompt_store = PromptConfigStore(self.session_factory)
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self.crm_adapter = self._build_crm_adapter()
         self.channel_adapter = self._build_channel_adapter()
@@ -55,7 +58,7 @@ class SalesAgentApplication:
             crm_adapter=self.crm_adapter,
             memory_store=self.memory_store,
             channel_adapter=self.channel_adapter,
-            planner=AgentPlanner(settings),
+            planner=AgentPlanner(settings, prompt_store=self.prompt_store),
             policy=ToolExecutionPolicy(),
         )
         self.inbound_processor = DebouncedInboundProcessor(
@@ -114,9 +117,9 @@ class SalesAgentApplication:
             contact=contact,
             recent_messages=[message.text for message in recent_messages],
             semantic_memories=semantic_memories,
+            prompt_mode=anchor_event.prompt_mode,
         )
-        prefix = "Ya registré este número como lead en el CRM. " if lead_created else ""
-        response_text = f"{prefix}{planning.response_text}".strip()
+        response_text = planning.response_text.strip()
 
         return PreparedBatchRun(
             run_id=uuid4().hex,
@@ -150,6 +153,9 @@ class SalesAgentApplication:
                 self.workflow.policy.validate(action)
                 if action.type == ActionType.UPDATE_STAGE and scoped_tools is not None:
                     current_lead = await scoped_tools.update_stage(action.args["stage"])
+                    payload = current_lead.model_dump(mode="json")
+                elif action.type == ActionType.UPDATE_CONTACT_FIELDS and scoped_tools is not None:
+                    current_lead = await scoped_tools.update_fields(action.args["fields"])
                     payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.APPEND_NOTE and scoped_tools is not None:
                     current_lead = await scoped_tools.add_note(action.args["note"])
@@ -212,6 +218,26 @@ class SalesAgentApplication:
             tool_results=result.tool_results,
             contact=result.contact,
         )
+
+    async def get_prompt_editor_state(self, mode: PromptMode = PromptMode.PUBLISHED) -> dict:
+        state = await self.prompt_store.get_editor_state(mode=mode)
+        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
+        return state
+
+    async def save_prompt_draft(self, business_prompt: str) -> dict:
+        state = await self.prompt_store.save_draft(business_prompt)
+        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
+        return state
+
+    async def publish_prompt_draft(self) -> dict:
+        state = await self.prompt_store.publish_draft()
+        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
+        return state
+
+    async def reset_prompt_draft(self) -> dict:
+        state = await self.prompt_store.reset_draft()
+        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
+        return state
 
     def _build_crm_adapter(self):
         if self.settings.crm_backend == "notion":

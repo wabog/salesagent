@@ -193,3 +193,36 @@ async def test_local_chat_batches_quick_messages_into_one_reply():
     assert renderable[0]["aggregated_messages"] == 3
     assert len(outbound_messages) == 1
     assert len(inbound_messages) == 3
+
+
+@pytest.mark.asyncio
+async def test_playground_prompt_config_can_save_and_publish_draft():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            initial = await client.get("/playground/prompt-config")
+            saved = await client.put(
+                "/playground/prompt-config",
+                json={"business_prompt": "Nuevo brief comercial para playground."},
+            )
+            draft = await client.get("/playground/prompt-config", params={"mode": "draft"})
+            published_before = await client.get("/playground/prompt-config", params={"mode": "published"})
+            published = await client.post("/playground/prompt-config/publish")
+
+    assert initial.status_code == 200
+    assert "core_prompt" in initial.json()
+    assert saved.status_code == 200
+    assert saved.json()["draft_business_prompt"] == "Nuevo brief comercial para playground."
+    assert draft.json()["active_business_prompt"] == "Nuevo brief comercial para playground."
+    assert published_before.json()["active_business_prompt"] != "Nuevo brief comercial para playground."
+    assert published.status_code == 200
+    assert published.json()["published_business_prompt"] == "Nuevo brief comercial para playground."

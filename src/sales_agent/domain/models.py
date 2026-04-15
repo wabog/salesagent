@@ -22,8 +22,14 @@ class Direction(StrEnum):
     OUTBOUND = "outbound"
 
 
+class PromptMode(StrEnum):
+    PUBLISHED = "published"
+    DRAFT = "draft"
+
+
 class ActionType(StrEnum):
     UPDATE_STAGE = "update_stage"
+    UPDATE_CONTACT_FIELDS = "update_contact_fields"
     APPEND_NOTE = "append_note"
     CREATE_FOLLOWUP = "create_followup"
     HANDOFF_HUMAN = "handoff_human"
@@ -39,6 +45,7 @@ class InboundMessage(BaseModel):
     channel: Channel = Channel.WHATSAPP
     provider: str = "kapso"
     contact_name: str | None = None
+    prompt_mode: PromptMode = PromptMode.PUBLISHED
 
     @field_validator("phone_number", mode="before")
     @classmethod

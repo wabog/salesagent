@@ -123,10 +123,10 @@ class SalesAgentWorkflow:
             contact=state["current_lead"],
             recent_messages=[message["text"] for message in state["recent_messages"]],
             semantic_memories=state["semantic_memories"],
+            prompt_mode=state["event"].prompt_mode,
         )
         state["planning"] = planning
-        prefix = "Ya registré este número como lead en el CRM. " if state["lead_created"] else ""
-        state["response_text"] = f"{prefix}{planning.response_text}".strip()
+        state["response_text"] = planning.response_text.strip()
         state["send_reply"] = planning.should_reply
         return state
 
@@ -148,6 +148,9 @@ class SalesAgentWorkflow:
                 self.policy.validate(action)
                 if action.type == ActionType.UPDATE_STAGE:
                     current_lead = await scoped_tools.update_stage(action.args["stage"])
+                    payload = current_lead.model_dump(mode="json")
+                elif action.type == ActionType.UPDATE_CONTACT_FIELDS:
+                    current_lead = await scoped_tools.update_fields(action.args["fields"])
                     payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.APPEND_NOTE:
                     current_lead = await scoped_tools.add_note(action.args["note"])

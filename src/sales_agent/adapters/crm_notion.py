@@ -69,7 +69,7 @@ class NotionCRMAdapter:
         if "stage" in fields and fields["stage"]:
             notion_properties[self._settings.notion_stage_property] = {"status": {"name": fields["stage"]}}
         if "email" in fields and fields["email"]:
-            notion_properties["Email"] = {"email": fields["email"]}
+            notion_properties[self._settings.notion_email_property] = {"email": fields["email"]}
         if "phone_number" in fields and fields["phone_number"]:
             notion_properties[self._settings.notion_phone_property] = {
                 "phone_number": phone_to_provider_digits(
@@ -177,16 +177,19 @@ class NotionCRMAdapter:
         name_prop = properties.get(self._settings.notion_name_property, {})
         stage_prop = properties.get(self._settings.notion_stage_property, {})
         phone_prop = properties.get(self._settings.notion_phone_property, {})
+        email_prop = properties.get(self._settings.notion_email_property, {})
         name_chunks = name_prop.get("title", [])
         full_name = "".join(chunk.get("plain_text", "") for chunk in name_chunks) or None
         stage_data = stage_prop.get("status") or {}
         stage = stage_data.get("name")
         phone_number = phone_prop.get("phone_number")
+        email = email_prop.get("email")
         return CRMContact(
             external_id=payload["id"],
             phone_number=phone_number,
             full_name=full_name,
             stage=stage,
+            email=email,
             metadata={"raw_properties": properties},
         )
 

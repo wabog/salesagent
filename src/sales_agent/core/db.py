@@ -64,6 +64,16 @@ class ContactShadowRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class PromptConfigRecord(Base):
+    __tablename__ = "prompt_configs"
+
+    prompt_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    draft_business_prompt: Mapped[str] = mapped_column(Text())
+    published_business_prompt: Mapped[str] = mapped_column(Text())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 def build_engine(database_url: str) -> AsyncEngine:
     return create_async_engine(database_url, future=True)
 

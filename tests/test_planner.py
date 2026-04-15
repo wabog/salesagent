@@ -1,5 +1,7 @@
+import pytest
+
 from sales_agent.core.config import Settings
-from sales_agent.domain.models import CRMContact, PlanningResult, ProposedAction
+from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
 from sales_agent.domain.models import ActionType
 from sales_agent.services.planner import AgentPlanner
 
@@ -208,3 +210,56 @@ def test_repair_actions_rewrites_followup_summary_when_it_is_raw_text():
 
     followup_action = next(action for action in repaired.actions if action.type == ActionType.CREATE_FOLLOWUP)
     assert followup_action.args["summary"] == "Coordinar fecha y hora para demo comercial."
+
+
+def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
+    planner = build_planner()
+
+    result = planner._plan_with_rules(  # noqa: SLF001
+        "Hola, mi nombre es juan perez y mi correo es juan@example.com",
+        None,
+    )
+
+    update_action = next(action for action in result.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
+    assert update_action.args["fields"] == {
+        "full_name": "Juan Perez",
+        "email": "juan@example.com",
+    }
+    assert "correo" in result.response_text.lower()
+
+
+class _FakeStructuredOutput:
+    def __init__(self) -> None:
+        self.last_prompt = ""
+
+    async def ainvoke(self, prompt: str):
+        self.last_prompt = prompt
+
+        class _Response:
+            def model_dump(self_nonlocal):  # noqa: ANN001
+                return {
+                    "intent": "generic_reply",
+                    "confidence": 0.75,
+                    "response_text": "Respuesta del modelo.",
+                    "should_reply": True,
+                    "actions": [],
+                }
+
+        return _Response()
+
+
+class _FakePromptStore:
+    async def get_business_prompt(self, mode: PromptMode) -> str:
+        return "DRAFT brief." if mode == PromptMode.DRAFT else "PUBLISHED brief."
+
+
+@pytest.mark.asyncio
+async def test_planner_uses_prompt_mode_to_load_editable_business_prompt():
+    planner = AgentPlanner(Settings(OPENAI_API_KEY=""), prompt_store=_FakePromptStore())
+    planner._llm = _FakeStructuredOutput()  # noqa: SLF001
+
+    await planner.plan("hola", None, [], [], prompt_mode=PromptMode.DRAFT)
+    assert "DRAFT brief." in planner._llm.last_prompt  # noqa: SLF001
+
+    await planner.plan("hola", None, [], [], prompt_mode=PromptMode.PUBLISHED)
+    assert "PUBLISHED brief." in planner._llm.last_prompt  # noqa: SLF001

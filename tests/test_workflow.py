@@ -51,7 +51,8 @@ async def test_workflow_creates_contact_and_updates_stage():
     assert contact is not None
     assert contact.stage == "Demo"
     assert len(recent) == 2
-    assert result.response_text.startswith("Ya registré este número como lead en el CRM.")
+    assert "Ya registré este número como lead en el CRM." not in result.response_text
+    assert result.response_text.startswith("Actualicé la etapa del lead a Demo.")
     assert recent[-1].text == result.response_text
     assert all(tool_result.action.type != "create_contact" for tool_result in result.tool_results)
 
@@ -96,7 +97,7 @@ async def test_existing_lead_is_reused_without_creation_side_effect():
     assert result.duplicate is False
     assert contact is not None
     assert contact.external_id == existing.external_id
-    assert not result.response_text.startswith("Ya registré este número como lead en el CRM.")
+    assert "Ya registré este número como lead en el CRM." not in result.response_text
 
 
 @pytest.mark.asyncio
@@ -132,6 +133,32 @@ async def test_workflow_does_not_reuse_stale_shadow_when_crm_contact_is_missing(
 
 
 @pytest.mark.asyncio
+async def test_workflow_updates_contact_fields_from_explicit_user_data():
+    workflow, crm, _ = await build_workflow()
+    existing = await crm.create_contact("573001119900", "Lead Inicial")
+
+    event = InboundMessage(
+        message_id="contact-update-1",
+        conversation_id="conv-contact-update",
+        phone_number="573001119900",
+        text="mi nombre es juan perez y mi correo es juan@example.com",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("+573001119900")
+
+    assert existing.external_id == contact.external_id
+    assert contact is not None
+    assert contact.full_name == "Juan Perez"
+    assert contact.email == "juan@example.com"
+    update_action = next(action for action in result.tool_results if action.action.type == ActionType.UPDATE_CONTACT_FIELDS)
+    assert update_action.success is True
+    assert "correo" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_workflow_repairs_missing_stage_during_tool_execution():
     engine = build_engine("sqlite+aiosqlite:///:memory:")
     await init_db(engine)
@@ -140,7 +167,7 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
     crm = InMemoryCRMAdapter()
 
     class StubPlanner:
-        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
+        async def plan(self, text, contact, recent_messages, semantic_memories, prompt_mode=None):  # noqa: ANN001
             return PlanningResult(
                 intent="demo_confirmation",
                 confidence=0.8,
