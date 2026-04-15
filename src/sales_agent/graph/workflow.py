@@ -156,7 +156,16 @@ class SalesAgentWorkflow:
                     current_lead = await scoped_tools.add_note(action.args["note"])
                     payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.CREATE_FOLLOWUP:
-                    payload = await scoped_tools.create_followup(action.args["summary"])
+                    payload = await scoped_tools.create_followup(
+                        action.args["summary"],
+                        due_date=action.args.get("due_date"),
+                    )
+                    current_lead = scoped_tools.current_lead
+                elif action.type == ActionType.COMPLETE_FOLLOWUP:
+                    payload = await scoped_tools.complete_followup(
+                        outcome=action.args.get("outcome"),
+                    )
+                    current_lead = scoped_tools.current_lead
                 elif action.type == ActionType.HANDOFF_HUMAN:
                     state["handoff_requested"] = True
                     payload = {"status": "requested"}

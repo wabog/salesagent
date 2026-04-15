@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import httpx
@@ -105,14 +105,18 @@ class NotionCRMAdapter:
     async def change_stage(self, external_id: str, stage: str) -> CRMContact:
         return await self.update_contact_fields(external_id, {"stage": stage})
 
-    async def create_followup(self, external_id: str, summary: str) -> dict:
+    async def create_followup(self, external_id: str, summary: str, due_date: str | None = None) -> dict:
+        target_due_date = due_date or (date.today() + timedelta(days=1)).isoformat()
         await self._request(
             "PATCH",
             f"/pages/{external_id}",
             json={
                 "properties": {
+                    self._settings.notion_followup_summary_property: {
+                        "rich_text": [{"text": {"content": summary[:1900]}}]
+                    },
                     self._settings.notion_next_action_property: {
-                        "date": {"start": date.today().isoformat()}
+                        "date": {"start": target_due_date}
                     },
                     self._settings.notion_last_contact_property: {
                         "date": {"start": date.today().isoformat()}
@@ -120,7 +124,42 @@ class NotionCRMAdapter:
                 }
             },
         )
-        return {"external_id": external_id, "summary": summary, "provider": "notion", "status": "recorded"}
+        return {
+            "external_id": external_id,
+            "summary": summary,
+            "due_date": target_due_date,
+            "provider": "notion",
+            "status": "recorded",
+        }
+
+    async def complete_followup(self, external_id: str, outcome: str | None = None) -> dict:
+        page = await self._request("GET", f"/pages/{external_id}")
+        contact = self._to_contact(page)
+        await self._request(
+            "PATCH",
+            f"/pages/{external_id}",
+            json={
+                "properties": {
+                    self._settings.notion_followup_summary_property: {
+                        "rich_text": []
+                    },
+                    self._settings.notion_next_action_property: {
+                        "date": None
+                    },
+                    self._settings.notion_last_contact_property: {
+                        "date": {"start": date.today().isoformat()}
+                    },
+                }
+            },
+        )
+        return {
+            "external_id": external_id,
+            "status": "completed",
+            "cleared_summary": contact.followup_summary,
+            "cleared_due_date": contact.followup_due_date.isoformat() if contact.followup_due_date else None,
+            "outcome": outcome,
+            "provider": "notion",
+        }
 
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
         async with httpx.AsyncClient(base_url=self._base_url, timeout=20.0) as client:
@@ -178,18 +217,30 @@ class NotionCRMAdapter:
         stage_prop = properties.get(self._settings.notion_stage_property, {})
         phone_prop = properties.get(self._settings.notion_phone_property, {})
         email_prop = properties.get(self._settings.notion_email_property, {})
+        notes_prop = properties.get(self._settings.notion_notes_property, {})
+        followup_prop = properties.get(self._settings.notion_followup_summary_property, {})
+        next_action_prop = properties.get(self._settings.notion_next_action_property, {})
         name_chunks = name_prop.get("title", [])
         full_name = "".join(chunk.get("plain_text", "") for chunk in name_chunks) or None
         stage_data = stage_prop.get("status") or {}
         stage = stage_data.get("name")
         phone_number = phone_prop.get("phone_number")
         email = email_prop.get("email")
+        note_chunks = notes_prop.get("rich_text", []) or notes_prop.get("text", [])
+        note_text = "".join(chunk.get("plain_text", "") for chunk in note_chunks).strip()
+        notes = [line.strip() for line in note_text.splitlines() if line.strip()]
+        followup_chunks = followup_prop.get("rich_text", []) or followup_prop.get("text", [])
+        followup_summary = "".join(chunk.get("plain_text", "") for chunk in followup_chunks).strip() or None
+        next_action_date = (next_action_prop.get("date") or {}).get("start")
         return CRMContact(
             external_id=payload["id"],
             phone_number=phone_number,
             full_name=full_name,
             stage=stage,
             email=email,
+            followup_summary=followup_summary,
+            followup_due_date=date.fromisoformat(next_action_date) if next_action_date else None,
+            notes=notes,
             metadata={"raw_properties": properties},
         )
 

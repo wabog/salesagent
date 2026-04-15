@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -156,6 +156,64 @@ async def test_workflow_updates_contact_fields_from_explicit_user_data():
     update_action = next(action for action in result.tool_results if action.action.type == ActionType.UPDATE_CONTACT_FIELDS)
     assert update_action.success is True
     assert "correo" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_workflow_persists_followup_summary_and_due_date():
+    workflow, crm, _ = await build_workflow()
+    await crm.create_contact("573001119901", "Lead Followup")
+
+    event = InboundMessage(
+        message_id="followup-1",
+        conversation_id="conv-followup",
+        phone_number="573001119901",
+        text="recordarme mañana enviar la propuesta",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("+573001119901")
+
+    assert contact is not None
+    assert contact.followup_summary == "recordarme mañana enviar la propuesta"
+    assert contact.followup_due_date == date.today() + timedelta(days=1)
+    assert contact.notes[-1] == (
+        f"{date.today().isoformat()} - Seguimiento creado: recordarme mañana enviar la propuesta. "
+        f"Vence: {(date.today() + timedelta(days=1)).isoformat()}."
+    )
+    followup_action = next(action for action in result.tool_results if action.action.type == ActionType.CREATE_FOLLOWUP)
+    assert followup_action.success is True
+    assert followup_action.payload["due_date"] == (date.today() + timedelta(days=1)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_workflow_completes_followup_and_logs_timeline_note():
+    workflow, crm, _ = await build_workflow()
+    created = await crm.create_contact("573001119902", "Lead Followup")
+    await crm.create_followup(created.external_id, "Enviar propuesta comercial.", due_date="2026-04-16")
+
+    event = InboundMessage(
+        message_id="followup-complete-1",
+        conversation_id="conv-followup-complete",
+        phone_number="573001119902",
+        text="listo, ya envié la propuesta",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    contact = await crm.find_contact_by_phone("+573001119902")
+
+    assert contact is not None
+    assert contact.followup_summary is None
+    assert contact.followup_due_date is None
+    completion_action = next(action for action in result.tool_results if action.action.type == ActionType.COMPLETE_FOLLOWUP)
+    assert completion_action.success is True
+    assert contact.notes[-1] == (
+        f"{date.today().isoformat()} - Seguimiento completado: Enviar propuesta comercial. "
+        "Resultado: listo, ya envié la propuesta."
+    )
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 import pytest
+from datetime import date
 
 from sales_agent.adapters.crm_notion import NotionCRMAdapter
 from sales_agent.core.config import Settings
@@ -59,3 +60,64 @@ async def test_find_contact_by_phone_falls_back_to_normalized_scan(monkeypatch):
     assert contact is not None
     assert contact.phone_number == "+573137661093"
     assert contact.full_name == "Fabian"
+
+
+def test_to_contact_reads_followup_summary_and_due_date():
+    adapter = NotionCRMAdapter(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="notion",
+            NOTION_API_KEY="test-token",
+            NOTION_DATA_SOURCE_ID="test-ds",
+        )
+    )
+
+    contact = adapter._to_contact(  # noqa: SLF001
+        {
+            "id": "lead-1",
+            "properties": {
+                "Nombre": {"title": [{"plain_text": "Fabian"}]},
+                "Etapa": {"status": {"name": "Prospecto"}},
+                "Telefono": {"phone_number": "313 7661093"},
+                "Resumen seguimiento": {"rich_text": [{"plain_text": "Enviar propuesta comercial"}]},
+                "Próxima acción": {"date": {"start": "2026-04-20"}},
+            },
+        }
+    )
+
+    assert contact.followup_summary == "Enviar propuesta comercial"
+    assert contact.followup_due_date == date(2026, 4, 20)
+
+
+def test_to_contact_reads_notes_as_timeline_lines():
+    adapter = NotionCRMAdapter(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="notion",
+            NOTION_API_KEY="test-token",
+            NOTION_DATA_SOURCE_ID="test-ds",
+        )
+    )
+
+    contact = adapter._to_contact(  # noqa: SLF001
+        {
+            "id": "lead-1",
+            "properties": {
+                "Nombre": {"title": [{"plain_text": "Fabian"}]},
+                "Etapa": {"status": {"name": "Prospecto"}},
+                "Telefono": {"phone_number": "313 7661093"},
+                "Notas": {
+                    "rich_text": [
+                        {"plain_text": "2026-04-15 - Seguimiento creado: Enviar propuesta.\n2026-04-16 - Seguimiento completado: Enviar propuesta."}
+                    ]
+                },
+            },
+        }
+    )
+
+    assert contact.notes == [
+        "2026-04-15 - Seguimiento creado: Enviar propuesta.",
+        "2026-04-16 - Seguimiento completado: Enviar propuesta.",
+    ]

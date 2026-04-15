@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -74,6 +76,15 @@ class SqlAlchemyMemoryStore:
     async def remember_contact(self, contact: CRMContact) -> None:
         async with self._session_factory() as session:
             existing = await session.get(ContactShadowRecord, contact.phone_number)
+            metadata = dict(contact.metadata)
+            if contact.followup_summary:
+                metadata["followup_summary"] = contact.followup_summary
+            else:
+                metadata.pop("followup_summary", None)
+            if contact.followup_due_date:
+                metadata["followup_due_date"] = contact.followup_due_date.isoformat()
+            else:
+                metadata.pop("followup_due_date", None)
             payload = {
                 "phone_number": contact.phone_number,
                 "external_id": contact.external_id,
@@ -81,7 +92,7 @@ class SqlAlchemyMemoryStore:
                 "stage": contact.stage,
                 "email": contact.email,
                 "notes_json": contact.notes,
-                "metadata_json": contact.metadata,
+                "metadata_json": metadata,
             }
             if existing is None:
                 session.add(ContactShadowRecord(**payload))
@@ -104,6 +115,12 @@ class SqlAlchemyMemoryStore:
                 email=record.email,
                 notes=record.notes_json,
                 metadata=record.metadata_json,
+                followup_summary=(record.metadata_json or {}).get("followup_summary"),
+                followup_due_date=(
+                    date.fromisoformat((record.metadata_json or {}).get("followup_due_date"))
+                    if (record.metadata_json or {}).get("followup_due_date")
+                    else None
+                ),
             )
 
     async def search_memories(self, conversation_id: str, query: str, limit: int = 3) -> list[str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, timedelta
 from textwrap import dedent
 
 from openai import OpenAIError
@@ -118,6 +119,7 @@ class AgentPlanner:
             Sales rules:
             - If the user explicitly shares or corrects contact data for the current lead, use UPDATE_CONTACT_FIELDS.
             - UPDATE_CONTACT_FIELDS can persist `full_name` and `email` for the current lead.
+            - If the user confirms that the current follow-up or promised next step was already completed, use COMPLETE_FOLLOWUP.
             - Use only these stage transitions when justified by the message:
               Prospecto -> Primer contacto
               Primer contacto -> Demo agendada
@@ -189,6 +191,12 @@ class AgentPlanner:
                 existing_summary = str(args.get("summary", "")).strip()
                 if not existing_summary or self._should_rewrite_followup_summary(existing_summary, text):
                     args["summary"] = self._build_followup_summary(text, recent_messages)
+                if not str(args.get("due_date", "")).strip():
+                    args["due_date"] = self._infer_followup_due_date(text, recent_messages)
+            if action.type == ActionType.COMPLETE_FOLLOWUP:
+                existing_outcome = str(args.get("outcome", "")).strip()
+                if not existing_outcome:
+                    args["outcome"] = self._build_followup_completion_outcome(text)
             repaired_actions.append(action.model_copy(update={"args": args}))
         return result.model_copy(update={"actions": repaired_actions})
 
@@ -204,6 +212,8 @@ class AgentPlanner:
         actions = [action.model_copy(deep=True) for action in result.actions]
         notes = {action.args.get("note", "").strip() for action in actions if action.type == ActionType.APPEND_NOTE}
         has_followup = any(action.type == ActionType.CREATE_FOLLOWUP for action in actions)
+        has_followup_completion = any(action.type == ActionType.COMPLETE_FOLLOWUP for action in actions)
+        completion_detected = self._should_complete_followup(lowered, contact)
         stage_index = next(
             (index for index, action in enumerate(actions) if action.type == ActionType.UPDATE_STAGE),
             None,
@@ -229,12 +239,25 @@ class AgentPlanner:
                 )
             )
 
-        if self._should_create_followup(lowered) and not has_followup:
+        if completion_detected and not has_followup_completion:
+            actions.append(
+                ProposedAction(
+                    type=ActionType.COMPLETE_FOLLOWUP,
+                    reason="La política comercial detectó que el siguiente paso vigente ya fue cumplido.",
+                    args={"outcome": self._build_followup_completion_outcome(text)},
+                )
+            )
+            has_followup_completion = True
+
+        if self._should_create_followup(lowered) and not has_followup and not completion_detected:
             actions.append(
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
                     reason="La política comercial requiere dejar el siguiente paso explícito.",
-                    args={"summary": self._build_followup_summary(text, recent_messages or [])},
+                    args={
+                        "summary": self._build_followup_summary(text, recent_messages or []),
+                        "due_date": self._infer_followup_due_date(text, recent_messages or []),
+                    },
                 )
             )
 
@@ -429,6 +452,24 @@ class AgentPlanner:
             return "Responder pricing o enviar propuesta comercial."
         return "Dar seguimiento comercial al lead."
 
+    def _infer_followup_due_date(self, text: str, recent_messages: list[str]) -> str:
+        lowered = text.lower()
+        recent_lowered = " ".join(message.lower() for message in recent_messages[-3:])
+        base_date = date.today()
+        if any(token in lowered for token in ("hoy", "esta tarde", "este rato")):
+            return base_date.isoformat()
+        if any(token in lowered for token in ("mañana", "manana")):
+            return (base_date + timedelta(days=1)).isoformat()
+        if "próxima semana" in lowered or "proxima semana" in lowered:
+            return (base_date + timedelta(days=7)).isoformat()
+        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+            return (base_date + timedelta(days=1)).isoformat()
+        if lowered.strip() in {"si", "sí", "si claro", "sí claro", "claro", "de una", "dale", "ok", "vale", "me sirve"} and any(
+            token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")
+        ):
+            return (base_date + timedelta(days=1)).isoformat()
+        return (base_date + timedelta(days=1)).isoformat()
+
     def _extract_current_tool(self, text: str) -> str | None:
         patterns = (
             r"(?:herramienta|tool|app)\s+llamada\s+([A-Za-z0-9][A-Za-z0-9_-]*)",
@@ -477,6 +518,55 @@ class AgentPlanner:
             "seguimiento",
         )
         return any(token in lowered_text for token in followup_signals)
+
+    def _should_complete_followup(self, lowered_text: str, contact: CRMContact | None) -> bool:
+        if contact is None or not contact.followup_summary:
+            return False
+        explicit_completion_phrases = (
+            "ya envié",
+            "ya envie",
+            "ya agendé",
+            "ya agende",
+            "ya coordiné",
+            "ya coordine",
+            "ya realicé",
+            "ya realice",
+            "ya quedó",
+            "ya quedo",
+            "ya se envió",
+            "ya se envio",
+            "ya se agendó",
+            "ya se agendo",
+            "ya está hecho",
+            "ya esta hecho",
+            "seguimiento completado",
+            "seguimiento cumplido",
+        )
+        if any(phrase in lowered_text for phrase in explicit_completion_phrases):
+            return True
+        completion_context_markers = (
+            "ya",
+            "listo",
+            "hecho",
+            "complet",
+            "cumpl",
+            "resuelto",
+        )
+        completion_action_markers = (
+            "envié",
+            "envie",
+            "agendé",
+            "agende",
+            "realicé",
+            "realice",
+            "coordiné",
+            "coordine",
+            "cerré",
+            "cerre",
+        )
+        return any(token in lowered_text for token in completion_context_markers) and any(
+            token in lowered_text for token in completion_action_markers
+        )
 
     def _plan_with_rules(self, text: str, contact: CRMContact | None) -> PlanningResult:
         lowered = text.lower()
@@ -548,12 +638,28 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
                     reason="El mensaje sugiere programar seguimiento.",
-                    args={"summary": text.strip()},
+                    args={
+                        "summary": text.strip(),
+                        "due_date": self._infer_followup_due_date(text, []),
+                    },
                 )
             )
             intent = "followup"
             confidence = max(confidence, 0.8)
             response_lines.append("Dejé creado un seguimiento para este lead.")
+
+        if self._should_complete_followup(lowered, contact):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.COMPLETE_FOLLOWUP,
+                    reason="El lead indicó que ya se cumplió el siguiente paso pendiente.",
+                    args={"outcome": self._build_followup_completion_outcome(text)},
+                )
+            )
+            if intent == "generic_reply":
+                intent = "followup_completed"
+                confidence = max(confidence, 0.78)
+            response_lines.append("Perfecto. Marco como completado el seguimiento activo.")
 
         if any(token in lowered for token in ("asesor", "humano", "llámame", "llamame")):
             actions.append(
@@ -601,7 +707,10 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
                     reason="Hay que dar siguiente paso comercial después de pedir demo.",
-                    args={"summary": self._build_followup_summary(text, [])},
+                    args={
+                        "summary": self._build_followup_summary(text, []),
+                        "due_date": self._infer_followup_due_date(text, []),
+                    },
                 )
             )
             response_lines.append(
@@ -674,3 +783,11 @@ class AgentPlanner:
                 return None
             return " ".join(part.capitalize() for part in parts)
         return None
+
+    def _build_followup_completion_outcome(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text.strip())
+        if not cleaned:
+            return "Lead confirmó que el seguimiento se completó."
+        if cleaned.endswith((".", "!", "?")):
+            return cleaned
+        return f"{cleaned}."

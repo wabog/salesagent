@@ -1,4 +1,5 @@
 import pytest
+from datetime import date, timedelta
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
@@ -210,6 +211,7 @@ def test_repair_actions_rewrites_followup_summary_when_it_is_raw_text():
 
     followup_action = next(action for action in repaired.actions if action.type == ActionType.CREATE_FOLLOWUP)
     assert followup_action.args["summary"] == "Coordinar fecha y hora para demo comercial."
+    assert followup_action.args["due_date"] == (date.today() + timedelta(days=1)).isoformat()
 
 
 def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
@@ -226,6 +228,62 @@ def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
         "email": "juan@example.com",
     }
     assert "correo" in result.response_text.lower()
+
+
+def test_sales_policy_marks_active_followup_as_completed_when_user_confirms_done():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        stage="Propuesta enviada",
+        followup_summary="Enviar propuesta comercial.",
+        followup_due_date=date(2026, 4, 16),
+    )
+    result = PlanningResult(
+        intent="generic_reply",
+        confidence=0.7,
+        response_text="Perfecto.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "Listo, ya envié la propuesta al cliente",
+        contact,
+        [],
+    )
+
+    completion_action = next(action for action in enforced.actions if action.type == ActionType.COMPLETE_FOLLOWUP)
+    assert "propuesta" in completion_action.args["outcome"].lower()
+    assert all(action.type != ActionType.CREATE_FOLLOWUP for action in enforced.actions)
+
+
+def test_sales_policy_does_not_complete_followup_for_future_reminder_request():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        stage="Propuesta enviada",
+        followup_summary="Enviar propuesta comercial.",
+        followup_due_date=date(2026, 4, 16),
+    )
+    result = PlanningResult(
+        intent="generic_reply",
+        confidence=0.7,
+        response_text="Perfecto.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "recordarme mañana enviar la propuesta",
+        contact,
+        [],
+    )
+
+    assert all(action.type != ActionType.COMPLETE_FOLLOWUP for action in enforced.actions)
 
 
 class _FakeStructuredOutput:

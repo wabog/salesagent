@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Any
 
@@ -32,6 +32,7 @@ class ActionType(StrEnum):
     UPDATE_CONTACT_FIELDS = "update_contact_fields"
     APPEND_NOTE = "append_note"
     CREATE_FOLLOWUP = "create_followup"
+    COMPLETE_FOLLOWUP = "complete_followup"
     HANDOFF_HUMAN = "handoff_human"
 
 
@@ -72,6 +73,8 @@ class CRMContact(BaseModel):
     full_name: str | None = None
     stage: str | None = None
     email: str | None = None
+    followup_summary: str | None = None
+    followup_due_date: date | None = None
     notes: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

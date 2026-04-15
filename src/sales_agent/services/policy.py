@@ -30,3 +30,11 @@ class ToolExecutionPolicy:
             summary = action.args.get("summary", "").strip()
             if not summary:
                 raise ValueError("Follow-up creation requires a summary.")
+            due_date = str(action.args.get("due_date", "")).strip()
+            if due_date:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date):
+                    raise ValueError("Follow-up due_date must use YYYY-MM-DD format.")
+        if action.type == ActionType.COMPLETE_FOLLOWUP:
+            outcome = str(action.args.get("outcome", "")).strip()
+            if outcome and len(outcome) > 500:
+                raise ValueError("Follow-up completion outcome is too long.")
