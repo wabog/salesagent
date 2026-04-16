@@ -1,0 +1,6 @@
+# Project-local Codex overrides for wabog-legal-flow.
+# This file is only loaded when the project is trusted by Codex.
+
+[mcp_servers.notion]
+enabled = true
+url = "https://mcp.notion.com/mcp"

@@ -126,7 +126,7 @@ def test_repair_actions_infers_demo_stage_from_affirmative_reply_and_recent_cont
     )
 
     stage_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_STAGE)
-    assert stage_action.args["stage"] == "Demo agendada"
+    assert stage_action.args["stage"] == "Primer contacto"
 
 
 def test_repair_actions_infers_first_contact_for_buying_intent_without_stage():
@@ -241,6 +241,66 @@ def test_build_meeting_payload_for_explicit_demo_time():
     assert payload["duration_minutes"] == planner._settings.google_calendar_default_meeting_minutes  # noqa: SLF001
     assert payload["title"] == "Demo Wabog - Lead Demo"
     assert "lead@example.com" in payload["description"]
+
+
+def test_build_meeting_payload_uses_recent_context_for_day_and_hour():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        email="lead@example.com",
+    )
+
+    payload = planner._build_meeting_payload(  # noqa: SLF001
+        "9 am me sirve",
+        contact,
+        ["Podemos agendar una demo el martes en la mañana."],
+    )
+
+    assert payload is not None
+    assert "T09:00:00" in payload["start_iso"]
+
+
+def test_sales_policy_requests_name_and_email_before_creating_meeting():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name=None,
+        email=None,
+        stage="Primer contacto",
+    )
+    result = PlanningResult(
+        intent="demo_interest",
+        confidence=0.82,
+        response_text="Perfecto, te la agendo.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "Agendemos la demo mañana a las 3 pm",
+        contact,
+        [],
+    )
+
+    assert all(action.type != ActionType.CREATE_MEETING for action in enforced.actions)
+    assert any(action.type == ActionType.CREATE_FOLLOWUP for action in enforced.actions)
+    assert "nombre completo" in enforced.response_text.lower()
+    assert "correo" in enforced.response_text.lower()
+
+
+def test_infer_stage_keeps_demo_interest_in_first_contact_without_exact_slot():
+    planner = build_planner()
+
+    inferred_stage = planner._infer_stage_from_text(  # noqa: SLF001
+        "puede ser una demo la otra semana tal vez",
+        "Prospecto",
+        [],
+    )
+
+    assert inferred_stage == "Primer contacto"
 
 
 def test_sales_policy_appends_self_schedule_link_for_demo_interest():

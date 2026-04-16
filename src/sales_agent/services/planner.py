@@ -120,6 +120,12 @@ class AgentPlanner:
             Sales rules:
             - If the user explicitly shares or corrects contact data for the current lead, use UPDATE_CONTACT_FIELDS.
             - UPDATE_CONTACT_FIELDS can persist `full_name` and `email` for the current lead.
+            - Never claim that a meeting, demo, invite, or calendar booking is confirmed unless CREATE_MEETING succeeded.
+            - Interest in a demo does not mean the demo is scheduled yet.
+            - Move a lead to `Demo agendada` only when there is a concrete date and time or the contact already has an upcoming calendar event.
+            - If the lead wants a demo but there is no exact slot yet, keep pushing to the next step without pretending it is booked.
+            - Before creating a meeting, make sure you have the lead full name and email if those fields are missing.
+            - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
             - If the user confirms that the current follow-up or promised next step was already completed, use COMPLETE_FOLLOWUP.
             - Use only these stage transitions when justified by the message:
               Prospecto -> Primer contacto
@@ -275,8 +281,14 @@ class AgentPlanner:
             )
             has_followup_completion = True
 
-        meeting_payload = self._build_meeting_payload(text, contact)
-        if meeting_payload and not has_meeting_creation and upcoming_event is None:
+        meeting_payload = self._build_meeting_payload(text, contact, recent_messages or [])
+        missing_meeting_fields = self._missing_contact_fields_for_meeting(contact)
+        if (
+            meeting_payload
+            and not has_meeting_creation
+            and upcoming_event is None
+            and not missing_meeting_fields
+        ):
             actions.append(
                 ProposedAction(
                     type=ActionType.CREATE_MEETING,
@@ -299,6 +311,8 @@ class AgentPlanner:
             )
 
         response_text = result.response_text
+        if meeting_payload and missing_meeting_fields and upcoming_event is None:
+            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields)
         if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
             response_text = self._append_self_schedule_link(response_text)
         if upcoming_event is not None:
@@ -309,6 +323,7 @@ class AgentPlanner:
     def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
         lowered = text.lower()
         recent_lowered = " ".join(message.lower() for message in (recent_messages or [])[-3:])
+        has_concrete_demo_slot = self._extract_requested_meeting_start(text, recent_messages) is not None
         affirmative_reply = lowered.strip() in {
             "si",
             "sí",
@@ -325,11 +340,11 @@ class AgentPlanner:
         }
         if affirmative_reply:
             if any(token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-                return "Demo agendada"
+                return "Demo agendada" if has_concrete_demo_slot else "Primer contacto"
             if any(token in recent_lowered for token in ("trial", "prueba", "probar", "testear")):
                 return "Prueba / Trial"
         if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-            return "Demo agendada"
+            return "Demo agendada" if has_concrete_demo_slot else "Primer contacto"
         if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
             return "Prueba / Trial"
         if any(token in lowered for token in ("negociación", "negociacion", "negociar", "descuento")):
@@ -422,7 +437,7 @@ class AgentPlanner:
             re.IGNORECASE,
         )
         lawyers_match = re.search(r"(\d+)\s+abogad", lowered)
-        processes_match = re.search(r"(\d+)\s+proces", lowered)
+        processes_match = re.search(r"(\d+)(?:\s*[-a]\s*(\d+))?\s+proces", lowered)
         current_tool = self._extract_current_tool(text)
         if current_tool is None:
             for previous_message in reversed(recent_messages[-4:]):
@@ -433,12 +448,17 @@ class AgentPlanner:
         context_bits: list[str] = []
         if firm_name_match:
             context_bits.append(f"Despacho {firm_name_match.group(1)}")
+        elif any(token in lowered for token in ("abogado solo", "abogada sola", "trabajo solo", "trabajo sola", "yo solo", "yo sola")):
+            context_bits.append("Abogado independiente")
         elif "despacho" in lowered or "firma" in lowered:
             context_bits.append("Despacho del lead")
         if lawyers_match:
             context_bits.append(f"{lawyers_match.group(1)} abogados")
         if processes_match:
-            context_bits.append(f"aprox. {processes_match.group(1)} procesos al mes")
+            if processes_match.group(2):
+                context_bits.append(f"aprox. {processes_match.group(1)}-{processes_match.group(2)} procesos al mes")
+            else:
+                context_bits.append(f"aprox. {processes_match.group(1)} procesos al mes")
         if context_bits:
             if len(context_bits) == 1:
                 sentences.append(f"{context_bits[0]}.")
@@ -448,10 +468,16 @@ class AgentPlanner:
         tool_and_pain_parts: list[str] = []
         if current_tool:
             tool_and_pain_parts.append(f"Hoy usan {current_tool}")
+        if "excel" in lowered:
+            tool_and_pain_parts.append("apoyan parte del proceso en Excel")
+        if "whatsapp" in lowered:
+            tool_and_pain_parts.append("usan WhatsApp en la operación diaria")
         if any(token in lowered for token in ("problema", "problemas", "seguimiento", "llevar", "llevando")) and "seguimiento" in lowered:
             tool_and_pain_parts.append("reportan dolor en el seguimiento de procesos")
         if any(token in lowered for token in ("no notifica", "notifica bien", "notificaciones", "notificar")):
             tool_and_pain_parts.append("indican fallas de notificaciones")
+        if any(token in lowered for token in ("se me pierden cosas", "se pierden cosas", "se me pasan cosas", "se me escapan cosas")):
+            tool_and_pain_parts.append("se le pierden tareas o pendientes en el flujo actual")
         if "whatsapp" in lowered and any(token in lowered for token in ("notifica", "notificaciones", "notificar")):
             tool_and_pain_parts.append("quieren recibir alertas por WhatsApp")
         if tool_and_pain_parts:
@@ -513,8 +539,13 @@ class AgentPlanner:
             return (base_date + timedelta(days=1)).isoformat()
         return (base_date + timedelta(days=1)).isoformat()
 
-    def _build_meeting_payload(self, text: str, contact: CRMContact | None) -> dict[str, str | int] | None:
-        start_at = self._extract_requested_meeting_start(text)
+    def _build_meeting_payload(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str] | None = None,
+    ) -> dict[str, str | int] | None:
+        start_at = self._extract_requested_meeting_start(text, recent_messages)
         if start_at is None:
             return None
         lead_label = (contact.full_name or "Lead").strip() if contact else "Lead"
@@ -581,6 +612,31 @@ class AgentPlanner:
             "seguimiento",
         )
         return any(token in lowered_text for token in followup_signals)
+
+    def _missing_contact_fields_for_meeting(self, contact: CRMContact | None) -> list[str]:
+        if contact is None:
+            return ["full_name", "email"]
+        missing: list[str] = []
+        if not (contact.full_name or "").strip():
+            missing.append("full_name")
+        if not (contact.email or "").strip():
+            missing.append("email")
+        return missing
+
+    def _build_missing_meeting_fields_response(self, missing_fields: list[str]) -> str:
+        if missing_fields == ["full_name", "email"]:
+            return (
+                "Perfecto. Para dejarte la demo agendada y enviarte la invitación, "
+                "compárteme tu nombre completo y tu correo."
+            )
+        if missing_fields == ["email"]:
+            return "Perfecto. Para enviarte la invitación de la demo, compárteme tu correo."
+        if missing_fields == ["full_name"]:
+            return "Perfecto. Antes de agendarla, compárteme tu nombre completo."
+        return (
+            "Perfecto. Antes de dejar la demo agendada, compárteme los datos que me faltan "
+            "para enviarte la invitación."
+        )
 
     def _should_complete_followup(self, lowered_text: str, contact: CRMContact | None) -> bool:
         if contact is None or not contact.followup_summary:
@@ -759,7 +815,10 @@ class AgentPlanner:
             if intent == "generic_reply":
                 intent = "demo_interest"
                 confidence = 0.85
-            add_stage_change("Demo agendada", "El lead pidió demo o reunión comercial.")
+            meeting_payload = self._build_meeting_payload(text, contact, [])
+            missing_meeting_fields = self._missing_contact_fields_for_meeting(contact)
+            target_stage = "Demo agendada" if meeting_payload and not missing_meeting_fields else "Primer contacto"
+            add_stage_change(target_stage, "El lead pidió demo o reunión comercial.")
             actions.append(
                 ProposedAction(
                     type=ActionType.APPEND_NOTE,
@@ -767,8 +826,7 @@ class AgentPlanner:
                     args={"note": self._build_sales_note(text, [])},
                 )
             )
-            meeting_payload = self._build_meeting_payload(text, contact)
-            if meeting_payload and upcoming_event is None:
+            if meeting_payload and upcoming_event is None and not missing_meeting_fields:
                 actions.append(
                     ProposedAction(
                         type=ActionType.CREATE_MEETING,
@@ -777,6 +835,8 @@ class AgentPlanner:
                     )
                 )
                 response_lines.append("Perfecto. Voy a dejar esa demo creada de una vez en el calendario.")
+            elif meeting_payload and missing_meeting_fields:
+                response_lines.append(self._build_missing_meeting_fields_response(missing_meeting_fields))
             elif upcoming_event is None:
                 actions.append(
                     ProposedAction(
@@ -884,6 +944,10 @@ class AgentPlanner:
         return f"Ya existe una demo futura en calendario para el lead. Inicio: {upcoming_event.get('start_iso')}."
 
     def _append_self_schedule_link(self, response_text: str) -> str:
+        if not self._settings.google_calendar_self_schedule_url:
+            return response_text
+        if self._settings.google_calendar_self_schedule_url in response_text:
+            return response_text
         link_line = f"Si te sirve, también puedes agendar directamente aquí: {self._settings.google_calendar_self_schedule_url}"
         if link_line in response_text:
             return response_text
@@ -914,8 +978,10 @@ class AgentPlanner:
             )
         )
 
-    def _extract_requested_meeting_start(self, text: str) -> datetime | None:
-        lowered = text.lower()
+    def _extract_requested_meeting_start(self, text: str, recent_messages: list[str] | None = None) -> datetime | None:
+        context_messages = [message.strip() for message in (recent_messages or [])[-3:] if message.strip()]
+        combined_text = " ".join(context_messages + [text.strip()]).strip()
+        lowered = combined_text.lower()
         if not any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
             return None
         tz = ZoneInfo(self._settings.google_calendar_timezone)
@@ -943,4 +1009,33 @@ class AgentPlanner:
             date_raw, hour_raw, minute_raw = isoish_match.groups()
             target_date = date.fromisoformat(date_raw)
             return datetime(target_date.year, target_date.month, target_date.day, int(hour_raw), int(minute_raw), tzinfo=tz)
+
+        weekday_map = {
+            "lunes": 0,
+            "martes": 1,
+            "miercoles": 2,
+            "miércoles": 2,
+            "jueves": 3,
+            "viernes": 4,
+            "sabado": 5,
+            "sábado": 5,
+            "domingo": 6,
+        }
+        weekday_match = re.search(r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", lowered)
+        hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lowered)
+        if weekday_match and hour_match:
+            weekday_name = weekday_match.group(1)
+            weekday = weekday_map[weekday_name]
+            days_ahead = (weekday - base_date.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target_date = base_date + timedelta(days=days_ahead)
+            hour_raw, minute_raw, meridiem = hour_match.groups()
+            hour = int(hour_raw)
+            minute = int(minute_raw or "0")
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
         return None

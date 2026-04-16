@@ -328,6 +328,14 @@ class SalesAgentApplication:
         contact: CRMContact | None,
     ) -> str:
         final_text = response_text.strip()
+        failed_meeting = next(
+            (
+                result
+                for result in tool_results
+                if not result.success and result.action.type == ActionType.CREATE_MEETING
+            ),
+            None,
+        )
         created_meeting = next(
             (
                 result.payload
@@ -346,6 +354,25 @@ class SalesAgentApplication:
             elif created_meeting.get("html_link"):
                 confirmation_lines.append(f"Detalle del evento: {created_meeting['html_link']}")
             return "\n".join(confirmation_lines)
+
+        if failed_meeting is not None:
+            missing_fields: list[str] = []
+            if contact is None or not (contact.full_name or "").strip():
+                missing_fields.append("nombre completo")
+            if contact is None or not (contact.email or "").strip():
+                missing_fields.append("correo")
+            if missing_fields:
+                joined = " y ".join(missing_fields)
+                return (
+                    "Todavía no la dejo agendada. "
+                    f"Antes necesito tu {joined} para enviarte bien la invitación."
+                )
+            if self.settings.google_calendar_self_schedule_url:
+                return (
+                    "Todavía no pude dejar la demo creada en calendario. "
+                    f"Si quieres, compárteme de nuevo el horario o usa este link: {self.settings.google_calendar_self_schedule_url}"
+                )
+            return "Todavía no pude dejar la demo creada en calendario. Si quieres, confirmamos de nuevo el horario."
 
         upcoming_event = (((contact.metadata if contact else {}) or {}).get("calendar") or {}).get("upcoming_event")
         if upcoming_event and not final_text:
