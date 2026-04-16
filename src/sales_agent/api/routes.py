@@ -23,7 +23,7 @@ class ChatPayload(BaseModel):
     text: str
     phone_number: str = "3156832405"
     conversation_id: str = "playground-conv"
-    contact_name: str | None = "Playground User"
+    contact_name: str | None = None
     prompt_mode: PromptMode = PromptMode.PUBLISHED
 
 
@@ -319,16 +319,20 @@ async def playground(request: Request, token: str | None = None) -> str:
       const promptStatus = document.getElementById("promptStatus");
       const corePrompt = document.getElementById("corePrompt");
       const publishedPrompt = document.getElementById("publishedPrompt");
-      const storeKey = "sales-agent-playground";
+      function currentChatKey() {
+        const normalizedPhone = (phone.value || "3156832405").trim() || "3156832405";
+        const normalizedConversation = (conversation.value || "playground-conv").trim() || "playground-conv";
+        return `sales-agent-playground:${normalizedPhone}:${normalizedConversation}`;
+      }
 
       function loadState() {
-        const raw = localStorage.getItem(storeKey);
+        const raw = localStorage.getItem(currentChatKey());
         if (!raw) return [];
         try { return JSON.parse(raw); } catch { return []; }
       }
 
       function saveState(messages) {
-        localStorage.setItem(storeKey, JSON.stringify(messages));
+        localStorage.setItem(currentChatKey(), JSON.stringify(messages));
       }
 
       function nextId(prefix) {
@@ -514,6 +518,12 @@ async def playground(request: Request, token: str | None = None) -> str:
         render([]);
         status.textContent = "Conversación reiniciada.";
       });
+      for (const field of [phone, conversation]) {
+        field.addEventListener("change", () => {
+          render(loadState());
+          status.textContent = "Contexto del playground actualizado.";
+        });
+      }
       render(loadState());
       loadPromptConfig();
     </script>

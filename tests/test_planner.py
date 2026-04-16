@@ -303,6 +303,108 @@ def test_infer_stage_keeps_demo_interest_in_first_contact_without_exact_slot():
     assert inferred_stage == "Primer contacto"
 
 
+def test_planning_guardrail_creates_meeting_from_recent_context_when_email_is_already_present():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        email="lead@example.com",
+        stage="Primer contacto",
+        followup_summary="Coordinar fecha y hora para demo comercial.",
+    )
+    result = PlanningResult(
+        intent="confirm_demo",
+        confidence=0.79,
+        response_text="Gracias por confirmar la demo. Procederé a enviar la invitación.",
+        actions=[
+            ProposedAction(
+                type=ActionType.UPDATE_STAGE,
+                reason="Demo confirmada para martes a las 9 am.",
+                args={"stage": "Primer contacto"},
+            ),
+            ProposedAction(
+                type=ActionType.COMPLETE_FOLLOWUP,
+                reason="La demo quedó lista.",
+                args={"outcome": "demo confirmada"},
+            ),
+        ],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "si, para la demo del martes a las 9",
+        contact,
+        [
+            "Perfecto. Para enviarte la invitación de la demo, compárteme tu correo.",
+            "mi correo es lead@example.com",
+            "Perfecto, ya tengo tu correo de contacto.",
+            "martes 9 am",
+        ],
+    )
+
+    action_types = [action.type for action in guarded.actions]
+    assert ActionType.CREATE_MEETING in action_types
+    assert ActionType.COMPLETE_FOLLOWUP not in action_types
+    stage_action = next(action for action in guarded.actions if action.type == ActionType.UPDATE_STAGE)
+    assert stage_action.args["stage"] == "Demo agendada"
+    assert "agendar la demo ahora mismo" in guarded.response_text.lower()
+
+
+def test_planning_guardrail_removes_false_booking_claim_without_meeting_action():
+    planner = build_planner()
+    result = PlanningResult(
+        intent="confirm_demo",
+        confidence=0.75,
+        response_text="Gracias por confirmar la demo para el martes. Procederé a enviar la invitación.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "si",
+        None,
+        ["martes 9 am"],
+    )
+
+    assert "procederé a enviar la invitación" not in guarded.response_text.lower()
+    assert "correctamente agendada" in guarded.response_text.lower()
+
+
+def test_planning_guardrail_projects_pending_contact_fields_before_setting_stage():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Carlos Ruiz",
+        stage="Primer contacto",
+    )
+    result = PlanningResult(
+        intent="provide_email",
+        confidence=0.8,
+        response_text="Perfecto, ya casi queda.",
+        actions=[
+            ProposedAction(
+                type=ActionType.UPDATE_CONTACT_FIELDS,
+                reason="El lead compartió su correo.",
+                args={"fields": {"email": "carlos@example.com"}},
+            ),
+        ],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "mi correo es carlos@example.com",
+        contact,
+        ["puede ser una demo", "martes 9 am"],
+    )
+
+    stage_action = next(action for action in guarded.actions if action.type == ActionType.UPDATE_STAGE)
+    meeting_action = next(action for action in guarded.actions if action.type == ActionType.CREATE_MEETING)
+    assert stage_action.args["stage"] == "Demo agendada"
+    assert meeting_action.args["title"] == "Demo Wabog - Carlos Ruiz"
+
+
 def test_sales_policy_appends_self_schedule_link_for_demo_interest():
     planner = build_planner_with_calendar_link()
     result = PlanningResult(
@@ -437,6 +539,76 @@ def test_sales_policy_marks_active_followup_as_completed_when_user_confirms_done
     completion_action = next(action for action in enforced.actions if action.type == ActionType.COMPLETE_FOLLOWUP)
     assert "propuesta" in completion_action.args["outcome"].lower()
     assert all(action.type != ActionType.CREATE_FOLLOWUP for action in enforced.actions)
+
+
+@pytest.mark.asyncio
+async def test_hard_rule_answers_name_from_current_contact():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Carlos Ruiz",
+    )
+
+    result = await planner.plan("como me llamo?", contact, [], [])
+
+    assert result.intent == "ask_name"
+    assert result.actions == []
+    assert "Carlos Ruiz" in result.response_text
+
+
+@pytest.mark.asyncio
+async def test_hard_rule_asks_for_name_when_contact_name_is_missing_or_placeholder():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="~",
+    )
+
+    result = await planner.plan("como me llamo", contact, [], [])
+
+    assert result.intent == "ask_name"
+    assert result.actions == []
+    assert "todavía no tengo tu nombre" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_hard_rule_does_not_treat_phone_number_as_contact_name():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="3150000000",
+    )
+
+    result = await planner.plan("como me llamo", contact, [], [])
+
+    assert result.intent == "ask_name"
+    assert "todavía no tengo tu nombre" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_hard_rule_distinguishes_contact_source_questions():
+    planner = build_planner()
+
+    result = await planner.plan("de donde sacaron mi numero?", None, [], [])
+
+    assert result.intent == "ask_contact_source"
+    assert result.actions == []
+    assert "te contactamos" in result.response_text.lower()
+
+
+def test_append_calendar_confirmation_removes_unsupported_reminder_promise():
+    planner = build_planner()
+
+    response_text = planner._append_calendar_confirmation(  # noqa: SLF001
+        "Perfecto, Carlos. Ya tienes la demo agendada para el martes 21 de abril a las 9:00 AM. Te enviaré un recordatorio antes de la fecha.",
+        {"start_iso": "2026-04-21T09:00:00-05:00"},
+    )
+
+    assert "recordatorio" not in response_text.lower()
+    assert "veo en calendario una demo futura" in response_text.lower()
 
 
 def test_sales_policy_does_not_complete_followup_for_future_reminder_request():

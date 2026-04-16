@@ -11,6 +11,14 @@ from sales_agent.domain.models import CRMContact
 
 
 class GoogleCalendarAdapter:
+    _GENERIC_CONTACT_NAMES = {
+        "playground user",
+        "lead",
+        "lead demo",
+        "usuario",
+        "user",
+    }
+
     def __init__(self, settings: Settings) -> None:
         if not settings.google_client_id or not settings.google_client_secret or not settings.google_refresh_token:
             raise ValueError("Google Calendar OAuth settings are incomplete.")
@@ -117,11 +125,20 @@ class GoogleCalendarAdapter:
         attendees = event.get("attendees") or []
         if email and any(str(item.get("email") or "").strip().lower() == email for item in attendees):
             return True
-        if full_name and (full_name in summary or full_name in description):
+        phone_number = (contact.phone_number or "").strip()
+        if phone_number and phone_number in description:
             return True
-        if contact.phone_number and contact.phone_number in description:
+        if not phone_number and self._is_specific_contact_name(full_name) and (full_name in summary or full_name in description):
             return True
         return False
+
+    def _is_specific_contact_name(self, full_name: str) -> bool:
+        normalized = " ".join(full_name.strip().lower().split())
+        if not normalized:
+            return False
+        if normalized in self._GENERIC_CONTACT_NAMES:
+            return False
+        return len(normalized) >= 6
 
     def _normalize_event(self, payload: dict[str, Any], *, source: str) -> dict[str, Any]:
         conference = payload.get("conferenceData") or {}

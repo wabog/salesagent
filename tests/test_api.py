@@ -100,6 +100,35 @@ async def test_local_chat_playground_flow():
 
 
 @pytest.mark.asyncio
+async def test_local_chat_playground_does_not_force_default_contact_name():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            chat = await client.post(
+                "/chat/local",
+                json={
+                    "text": "hola",
+                    "phone_number": "3156832500",
+                    "conversation_id": "playground-no-name",
+                },
+            )
+        shadow = await app.state.sales_agent.memory_store.get_contact_shadow("+573156832500")
+
+    assert chat.status_code == 200
+    assert shadow is not None
+    assert shadow.full_name is None
+
+
+@pytest.mark.asyncio
 async def test_playground_disabled_in_production():
     app = create_app(
         Settings(
@@ -270,7 +299,7 @@ async def test_prepare_batched_run_reuses_recent_messages_from_same_phone_across
                     text="listo",
                     timestamp=datetime.now(timezone.utc),
                     raw_payload={},
-                    provider="local-playground",
+                    provider="kapso",
                 )
             ]
         )
@@ -278,3 +307,95 @@ async def test_prepare_batched_run_reuses_recent_messages_from_same_phone_across
     recent_texts = [message.text for message in prepared.recent_messages]
     assert "Necesito revisar una propuesta de Wabog." in recent_texts
     assert "Perfecto, te envio la propuesta y manana hacemos seguimiento." in recent_texts
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_playground_keeps_context_isolated_per_conversation():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        memory_store = app.state.sales_agent.memory_store
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="prev-in-playground",
+                conversation_id="conv-old",
+                phone_number="3156832405",
+                direction=Direction.INBOUND,
+                text="Necesito revisar una propuesta de Wabog.",
+            )
+        )
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="prev-out-playground",
+                conversation_id="conv-old",
+                phone_number="3156832405",
+                direction=Direction.OUTBOUND,
+                text="Perfecto, te envío una propuesta y hacemos seguimiento.",
+            )
+        )
+
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="new-playground-1",
+                    conversation_id="conv-new",
+                    phone_number="3156832405",
+                    text="hola",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                )
+            ]
+        )
+
+    recent_texts = [message.text for message in prepared.recent_messages]
+    assert "Necesito revisar una propuesta de Wabog." not in recent_texts
+    assert "Perfecto, te envío una propuesta y hacemos seguimiento." not in recent_texts
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_ignores_other_phone_messages_inside_same_conversation():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        memory_store = app.state.sales_agent.memory_store
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="conv-shared-old",
+                conversation_id="conv-shared",
+                phone_number="3156832405",
+                direction=Direction.INBOUND,
+                text="Necesito una demo para mi despacho.",
+            )
+        )
+
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="conv-shared-new",
+                    conversation_id="conv-shared",
+                    phone_number="3156832500",
+                    text="hola",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                )
+            ]
+        )
+
+    recent_texts = [message.text for message in prepared.recent_messages]
+    assert "Necesito una demo para mi despacho." not in recent_texts

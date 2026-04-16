@@ -57,6 +57,10 @@ def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
     return merged[-limit:]
 
 
+def _is_playground_event(event: InboundMessage) -> bool:
+    return event.provider == "local-playground"
+
+
 @dataclass
 class PreparedBatchRun:
     run_id: str
@@ -143,15 +147,23 @@ class SalesAgentApplication:
         )
 
         conversation_recent = await self.memory_store.get_recent_messages(anchor_event.conversation_id, limit=12)
-        conversation_recent = [message for message in conversation_recent if message.message_id not in batch_message_ids]
-        lead_recent = await self.memory_store.get_recent_messages_by_phone(anchor_event.phone_number, limit=12)
-        lead_recent = [message for message in lead_recent if message.message_id not in batch_message_ids]
+        conversation_recent = [
+            message
+            for message in conversation_recent
+            if message.message_id not in batch_message_ids and message.phone_number == anchor_event.phone_number
+        ]
+        lead_recent: list[ConversationMessage] = []
+        semantic_memory_groups: list[list[str]] = [
+            await self.memory_store.search_memories(anchor_event.conversation_id, combined_text)
+        ]
+        if not _is_playground_event(anchor_event):
+            lead_recent = await self.memory_store.get_recent_messages_by_phone(anchor_event.phone_number, limit=12)
+            lead_recent = [message for message in lead_recent if message.message_id not in batch_message_ids]
+            semantic_memory_groups.append(
+                await self.memory_store.search_memories_by_phone(anchor_event.phone_number, combined_text)
+            )
         recent_messages = _merge_unique_messages(conversation_recent, lead_recent, limit=12)
-        semantic_memories = _merge_unique_texts(
-            await self.memory_store.search_memories(anchor_event.conversation_id, combined_text),
-            await self.memory_store.search_memories_by_phone(anchor_event.phone_number, combined_text),
-            limit=6,
-        )
+        semantic_memories = _merge_unique_texts(*semantic_memory_groups, limit=6)
         planning = await self.workflow.planner.plan(
             text=combined_text,
             contact=contact,

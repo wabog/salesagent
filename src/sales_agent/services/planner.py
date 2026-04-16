@@ -56,11 +56,15 @@ class AgentPlanner:
         semantic_memories: list[str],
         prompt_mode: PromptMode = PromptMode.PUBLISHED,
     ) -> PlanningResult:
+        hard_rule_result = self._apply_hard_rules(text, contact)
+        if hard_rule_result is not None:
+            return hard_rule_result
         if self._llm is not None:
             try:
                 result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories, prompt_mode)
                 repaired = self._repair_actions(result, text, contact, recent_messages)
-                return self._enforce_sales_policy(repaired, text, contact, recent_messages)
+                enforced = self._enforce_sales_policy(repaired, text, contact, recent_messages)
+                return self._apply_planning_guardrail(enforced, text, contact, recent_messages)
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
         return self._plan_with_rules(text, contact)
@@ -126,6 +130,12 @@ class AgentPlanner:
             - If the lead wants a demo but there is no exact slot yet, keep pushing to the next step without pretending it is booked.
             - Before creating a meeting, make sure you have the lead full name and email if those fields are missing.
             - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
+            - Reuse recent conversation context aggressively. If the last user message only confirms something like "si, agenda", "martes a las 9", or "dale", combine it with prior turns before deciding actions.
+            - If a prior turn already gave the day or hour for a demo and the current turn confirms it, create the meeting immediately when contact data is sufficient.
+            - Do not ask again for data that the current lead already has in Contact.
+            - Distinguish identity questions from contact-source questions. "como me llamo", "cual es mi nombre", and "como me tienes guardado" ask about the lead name, not about how Wabog contacted them.
+            - For identity questions, answer from the current Contact. If the current lead has no reliable name yet, say that plainly and ask for it.
+            - Questions like "de donde sacaron mi numero", "como consiguieron mi contacto", or "como me llamaron" are about contact source, not the lead name.
             - If the user confirms that the current follow-up or promised next step was already completed, use COMPLETE_FOLLOWUP.
             - Use only these stage transitions when justified by the message:
               Prospecto -> Primer contacto
@@ -162,6 +172,50 @@ class AgentPlanner:
             {text}
             """
         ).strip()
+
+    def _apply_hard_rules(self, text: str, contact: CRMContact | None) -> PlanningResult | None:
+        normalized = self._normalize_lookup_text(text)
+        if normalized in {
+            "como me llamo",
+            "cual es mi nombre",
+            "que nombre tienes mio",
+            "que nombre tienes de mi",
+            "como me tienes guardado",
+        }:
+            full_name = (contact.full_name or "").strip() if contact else ""
+            if self._is_specific_contact_name(full_name, contact.phone_number if contact else None):
+                response_text = f"Te tengo registrado como {full_name}."
+            else:
+                response_text = "Todavía no tengo tu nombre registrado. Si quieres, compártemelo y lo guardo."
+            return PlanningResult(
+                intent="ask_name",
+                confidence=0.99,
+                response_text=response_text,
+                actions=[],
+                should_reply=True,
+            )
+
+        if normalized in {
+            "de donde sacaron mi numero",
+            "de donde sacaste mi numero",
+            "como consiguieron mi numero",
+            "como consiguieron mi contacto",
+            "como me llamaron",
+            "como me llamaste",
+            "como me contacto wabog",
+            "porque me escribieron",
+        }:
+            return PlanningResult(
+                intent="ask_contact_source",
+                confidence=0.96,
+                response_text=(
+                    "Te contactamos porque tu número quedó registrado como posible interesado en soluciones de Wabog "
+                    "para abogados y equipos legales. Si prefieres, también te cuento brevemente qué hacemos."
+                ),
+                actions=[],
+                should_reply=True,
+            )
+        return None
 
     def _repair_actions(
         self,
@@ -209,7 +263,7 @@ class AgentPlanner:
                 if not existing_outcome:
                     args["outcome"] = self._build_followup_completion_outcome(text)
             if action.type == ActionType.CREATE_MEETING:
-                meeting_payload = self._build_meeting_payload(text, contact)
+                meeting_payload = self._build_meeting_payload(text, contact, recent_messages)
                 if meeting_payload:
                     merged_payload = dict(meeting_payload)
                     merged_payload.update({key: value for key, value in args.items() if value})
@@ -320,6 +374,84 @@ class AgentPlanner:
 
         return result.model_copy(update={"actions": actions, "response_text": response_text})
 
+    def _apply_planning_guardrail(
+        self,
+        result: PlanningResult,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str] | None = None,
+    ) -> PlanningResult:
+        actions = [action.model_copy(deep=True) for action in result.actions]
+        recent_messages = recent_messages or []
+        projected_contact = self._project_contact_for_actions(contact, actions, text)
+        meeting_payload = self._build_meeting_payload(text, projected_contact, recent_messages)
+        missing_meeting_fields = self._missing_contact_fields_for_meeting(projected_contact)
+        upcoming_event = self._get_upcoming_calendar_event(contact)
+
+        if meeting_payload and upcoming_event is None:
+            actions = [
+                action
+                for action in actions
+                if action.type not in {ActionType.COMPLETE_FOLLOWUP, ActionType.CREATE_FOLLOWUP}
+            ]
+
+            stage_updated = False
+            meeting_present = False
+            normalized_actions: list[ProposedAction] = []
+            for action in actions:
+                if action.type == ActionType.UPDATE_STAGE:
+                    stage_updated = True
+                    normalized_actions.append(
+                        action.model_copy(
+                            update={
+                                "reason": "El guardrail detectó que ya existe contexto suficiente para tratar la demo como agendada.",
+                                "args": {"stage": "Demo agendada"} if not missing_meeting_fields else {"stage": "Primer contacto"},
+                            }
+                        )
+                    )
+                    continue
+                if action.type == ActionType.CREATE_MEETING:
+                    meeting_present = True
+                    normalized_actions.append(
+                        action.model_copy(
+                            update={
+                                "reason": "El guardrail reconstruyó el slot de agenda usando el contexto reciente.",
+                                "args": meeting_payload,
+                            }
+                        )
+                    )
+                    continue
+                normalized_actions.append(action)
+
+            if not stage_updated:
+                normalized_actions.append(
+                    ProposedAction(
+                        type=ActionType.UPDATE_STAGE,
+                        reason="El guardrail fija la etapa comercial según el contexto actual de agenda.",
+                        args={"stage": "Demo agendada"} if not missing_meeting_fields else {"stage": "Primer contacto"},
+                    )
+                )
+            if not missing_meeting_fields and not meeting_present:
+                normalized_actions.append(
+                    ProposedAction(
+                        type=ActionType.CREATE_MEETING,
+                        reason="El guardrail detectó fecha y hora concretas para crear la demo sin esperar otra confirmación.",
+                        args=meeting_payload,
+                    )
+                )
+            actions = normalized_actions
+
+        response_text = result.response_text
+        if meeting_payload and not missing_meeting_fields and upcoming_event is None:
+            response_text = "Perfecto. Voy a agendar la demo ahora mismo."
+        elif meeting_payload and missing_meeting_fields and upcoming_event is None:
+            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields)
+
+        if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
+            response_text = self._strip_false_booking_claims(response_text)
+
+        return result.model_copy(update={"actions": actions, "response_text": response_text})
+
     def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
         lowered = text.lower()
         recent_lowered = " ".join(message.lower() for message in (recent_messages or [])[-3:])
@@ -425,6 +557,49 @@ class AgentPlanner:
 
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", value.strip().lower())
+
+    def _normalize_lookup_text(self, value: str) -> str:
+        normalized = self._normalize_text(value)
+        normalized = normalized.translate(str.maketrans("áéíóúü", "aeiouu"))
+        normalized = re.sub(r"[^a-z0-9ñ\s]", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def _is_specific_contact_name(self, value: str | None, phone_number: str | None = None) -> bool:
+        normalized = self._normalize_lookup_text(value or "")
+        if not normalized:
+            return False
+        phone_digits = re.sub(r"\D", "", phone_number or "")
+        value_digits = re.sub(r"\D", "", value or "")
+        if phone_digits and value_digits and (phone_digits.endswith(value_digits) or value_digits.endswith(phone_digits)):
+            return False
+        return normalized not in {"~", "-", "lead", "usuario", "user", "playground user", "sin nombre"}
+
+    def _project_contact_for_actions(
+        self,
+        contact: CRMContact | None,
+        actions: list[ProposedAction],
+        text: str,
+    ) -> CRMContact | None:
+        if contact is None:
+            return None
+        projected = contact.model_copy(deep=True)
+        explicit_email = self._extract_email(text)
+        explicit_name = self._extract_explicit_name(text)
+        if explicit_email:
+            projected.email = explicit_email
+        if explicit_name:
+            projected.full_name = explicit_name
+        for action in actions:
+            if action.type != ActionType.UPDATE_CONTACT_FIELDS:
+                continue
+            fields = action.args.get("fields")
+            if not isinstance(fields, dict):
+                continue
+            if str(fields.get("email", "")).strip():
+                projected.email = str(fields["email"]).strip()
+            if str(fields.get("full_name", "")).strip():
+                projected.full_name = str(fields["full_name"]).strip()
+        return projected
 
     def _build_sales_note(self, text: str, recent_messages: list[str]) -> str:
         lowered = text.lower()
@@ -637,6 +812,24 @@ class AgentPlanner:
             "Perfecto. Antes de dejar la demo agendada, compárteme los datos que me faltan "
             "para enviarte la invitación."
         )
+
+    def _strip_false_booking_claims(self, response_text: str) -> str:
+        lowered = response_text.lower()
+        false_booking_signals = (
+            "ya te deje la demo agendada",
+            "ya te dejé la demo agendada",
+            "ya quedo agendada",
+            "ya quedó agendada",
+            "te enviare la invitacion",
+            "te enviaré la invitación",
+            "procedere a enviar la invitacion",
+            "procederé a enviar la invitación",
+            "voy a enviar la invitacion",
+            "voy a enviar la invitación",
+        )
+        if not any(signal in lowered for signal in false_booking_signals):
+            return response_text
+        return "Perfecto. Revisemos los datos y el horario para dejar la demo correctamente agendada."
 
     def _should_complete_followup(self, lowered_text: str, contact: CRMContact | None) -> bool:
         if contact is None or not contact.followup_summary:
@@ -954,13 +1147,31 @@ class AgentPlanner:
         return f"{response_text} {link_line}".strip()
 
     def _append_calendar_confirmation(self, response_text: str, upcoming_event: dict) -> str:
+        response_text = self._strip_unsupported_reminder_promises(response_text)
         confirmation = f"Veo en calendario una demo futura para {upcoming_event.get('start_iso')}."
         if confirmation in response_text:
             return response_text
         return f"{response_text} {confirmation}".strip()
 
+    def _strip_unsupported_reminder_promises(self, response_text: str) -> str:
+        cleaned = re.sub(
+            r"\s*Te enviar[eé] un recordatorio antes de la fecha\.?",
+            "",
+            response_text,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\s*Te voy a recordar antes de la fecha\.?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
     def _should_offer_self_schedule_link(self, lowered_text: str, upcoming_event: dict | None) -> bool:
         if upcoming_event is not None:
+            return False
+        if self._extract_requested_meeting_start(lowered_text, []) is not None:
             return False
         return any(
             token in lowered_text
@@ -979,7 +1190,7 @@ class AgentPlanner:
         )
 
     def _extract_requested_meeting_start(self, text: str, recent_messages: list[str] | None = None) -> datetime | None:
-        context_messages = [message.strip() for message in (recent_messages or [])[-3:] if message.strip()]
+        context_messages = [message.strip() for message in (recent_messages or [])[-6:] if message.strip()]
         combined_text = " ".join(context_messages + [text.strip()]).strip()
         lowered = combined_text.lower()
         if not any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
