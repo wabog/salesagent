@@ -30,6 +30,25 @@ async def build_workflow():
     return workflow, crm, memory
 
 
+class _StubCalendarAdapter:
+    async def find_upcoming_meeting(self, contact, lookahead_days: int = 45):  # noqa: ANN001
+        return None
+
+    async def create_meeting(self, contact, *, start_iso, duration_minutes, title, description):  # noqa: ANN001
+        return {
+            "id": "evt-1",
+            "summary": title,
+            "description": description,
+            "start_iso": start_iso,
+            "end_iso": start_iso,
+            "html_link": "https://calendar.google.com/event?eid=evt-1",
+            "meet_link": "https://meet.google.com/test-meet",
+            "status": "confirmed",
+            "attendees": [contact.email] if contact.email else [],
+            "source": "agent_created",
+        }
+
+
 @pytest.mark.asyncio
 async def test_workflow_creates_contact_and_updates_stage():
     workflow, crm, memory = await build_workflow()
@@ -266,3 +285,70 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
     assert contact.stage == "Demo agendada"
     assert result.tool_results[0].success is True
 
+
+@pytest.mark.asyncio
+async def test_workflow_preserves_calendar_metadata_after_meeting_creation_and_crm_updates():
+    engine = build_engine("sqlite+aiosqlite:///:memory:")
+    await init_db(engine)
+    session_factory = build_session_factory(engine)
+    memory = SqlAlchemyMemoryStore(session_factory)
+    crm = InMemoryCRMAdapter()
+
+    class StubPlanner:
+        async def plan(self, text, contact, recent_messages, semantic_memories, prompt_mode=None):  # noqa: ANN001
+            return PlanningResult(
+                intent="demo_scheduled",
+                confidence=0.9,
+                response_text="Perfecto.",
+                actions=[
+                    ProposedAction(
+                        type=ActionType.CREATE_MEETING,
+                        reason="Lead dio fecha y hora.",
+                        args={
+                            "start_iso": "2026-04-17T15:00:00-05:00",
+                            "duration_minutes": 30,
+                            "title": "Demo Wabog - Lead Demo",
+                            "description": "Demo comercial.",
+                        },
+                    ),
+                    ProposedAction(
+                        type=ActionType.UPDATE_STAGE,
+                        reason="Avanzar a demo agendada.",
+                        args={"stage": "Demo agendada"},
+                    ),
+                    ProposedAction(
+                        type=ActionType.APPEND_NOTE,
+                        reason="Registrar interés.",
+                        args={"note": "Lead agendó demo."},
+                    ),
+                ],
+            )
+
+        def _infer_stage_from_text(self, text, current_stage, recent_messages):  # noqa: ANN001
+            return "Demo agendada"
+
+    workflow = SalesAgentWorkflow(
+        crm_adapter=crm,
+        memory_store=memory,
+        channel_adapter=ConsoleChannelAdapter(),
+        planner=StubPlanner(),
+        policy=ToolExecutionPolicy(),
+        calendar_adapter=_StubCalendarAdapter(),
+    )
+
+    created = await crm.create_contact("573001250000", "Lead Demo")
+    await crm.update_contact_fields(created.external_id, {"email": "lead@example.com"})
+    event = InboundMessage(
+        message_id="meeting-1",
+        conversation_id="conv-meeting",
+        phone_number="573001250000",
+        text="agendemos la demo mañana a las 3 pm",
+        timestamp=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    result = await workflow.run(event)
+    assert any(item.action.type == ActionType.CREATE_MEETING and item.success for item in result.tool_results)
+    assert result.contact is not None
+    calendar_state = (result.contact.metadata or {}).get("calendar") or {}
+    assert (calendar_state.get("upcoming_event") or {}).get("id") == "evt-1"

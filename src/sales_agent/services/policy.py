@@ -38,3 +38,12 @@ class ToolExecutionPolicy:
             outcome = str(action.args.get("outcome", "")).strip()
             if outcome and len(outcome) > 500:
                 raise ValueError("Follow-up completion outcome is too long.")
+        if action.type == ActionType.CREATE_MEETING:
+            start_iso = str(action.args.get("start_iso", "")).strip()
+            if not start_iso:
+                raise ValueError("Meeting creation requires start_iso.")
+            if "T" not in start_iso:
+                raise ValueError("Meeting start_iso must be ISO-like with date and time.")
+            duration_minutes = int(action.args.get("duration_minutes", 0) or 0)
+            if duration_minutes <= 0:
+                raise ValueError("Meeting creation requires a positive duration_minutes.")

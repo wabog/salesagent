@@ -33,6 +33,7 @@ class ActionType(StrEnum):
     APPEND_NOTE = "append_note"
     CREATE_FOLLOWUP = "create_followup"
     COMPLETE_FOLLOWUP = "complete_followup"
+    CREATE_MEETING = "create_meeting"
     HANDOFF_HUMAN = "handoff_human"
 
 

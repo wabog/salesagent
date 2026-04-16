@@ -13,6 +13,7 @@ from sales_agent.domain.models import (
     ToolExecutionResult,
 )
 from sales_agent.domain.state import AgentState
+from sales_agent.services.calendar_sync import enrich_contact_with_calendar, merge_contact_with_shadow
 from sales_agent.services.lead_scope import LeadScopedCRMTools
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
@@ -41,12 +42,21 @@ def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
 
 
 class SalesAgentWorkflow:
-    def __init__(self, crm_adapter, memory_store, channel_adapter, planner: AgentPlanner, policy: ToolExecutionPolicy):
+    def __init__(
+        self,
+        crm_adapter,
+        memory_store,
+        channel_adapter,
+        planner: AgentPlanner,
+        policy: ToolExecutionPolicy,
+        calendar_adapter=None,
+    ):
         self.crm = crm_adapter
         self.memory = memory_store
         self.channel = channel_adapter
         self.planner = planner
         self.policy = policy
+        self.calendar = calendar_adapter
         self.graph = self._build_graph().compile()
 
     async def run(self, event) -> AgentRunResult:
@@ -122,13 +132,20 @@ class SalesAgentWorkflow:
 
     async def _resolve_current_lead(self, state: AgentState) -> AgentState:
         contact = await self.crm.find_contact_by_phone(state["event"].phone_number)
+        shadow = await self.memory.get_contact_shadow(state["event"].phone_number)
         if contact is None:
-            shadow = await self.memory.get_contact_shadow(state["event"].phone_number)
             contact = await self.crm.create_contact(
                 phone_number=state["event"].phone_number,
                 full_name=state["event"].contact_name or (shadow.full_name if shadow else None),
             )
             state["lead_created"] = True
+        if shadow is not None:
+            contact = merge_contact_with_shadow(contact, shadow)
+        contact = await enrich_contact_with_calendar(
+            contact,
+            self.calendar,
+            getattr(self.planner, "_settings", None).google_calendar_self_schedule_url if getattr(self.planner, "_settings", None) else None,
+        )
         state["current_lead"] = contact
         return state
 
@@ -161,7 +178,7 @@ class SalesAgentWorkflow:
     async def _execute_tools(self, state: AgentState) -> AgentState:
         planning = state["planning"]
         current_lead = state["current_lead"]
-        scoped_tools = LeadScopedCRMTools(self.crm, current_lead)
+        scoped_tools = LeadScopedCRMTools(self.crm, current_lead, calendar_adapter=self.calendar)
         results: list[ToolExecutionResult] = []
         for action in planning.actions:
             try:
@@ -194,6 +211,14 @@ class SalesAgentWorkflow:
                         outcome=action.args.get("outcome"),
                     )
                     current_lead = scoped_tools.current_lead
+                elif action.type == ActionType.CREATE_MEETING:
+                    payload = await scoped_tools.create_meeting(
+                        start_iso=action.args["start_iso"],
+                        duration_minutes=int(action.args.get("duration_minutes", 30)),
+                        title=action.args["title"],
+                        description=action.args["description"],
+                    )
+                    current_lead = scoped_tools.current_lead
                 elif action.type == ActionType.HANDOFF_HUMAN:
                     state["handoff_requested"] = True
                     payload = {"status": "requested"}
@@ -205,6 +230,21 @@ class SalesAgentWorkflow:
                 state["errors"].append(str(exc))
         state["tool_results"] = results
         state["current_lead"] = current_lead
+        created_meeting = next(
+            (
+                result.payload
+                for result in results
+                if result.success and result.action.type == ActionType.CREATE_MEETING
+            ),
+            None,
+        )
+        if created_meeting:
+            lines = [f"Listo. Ya te dejé la demo agendada para {created_meeting.get('start_iso')}."]
+            if created_meeting.get("meet_link"):
+                lines.append(f"Link de Meet: {created_meeting['meet_link']}")
+            elif created_meeting.get("html_link"):
+                lines.append(f"Detalle del evento: {created_meeting['html_link']}")
+            state["response_text"] = "\n".join(lines)
         return state
 
     async def _persist_state(self, state: AgentState) -> AgentState:

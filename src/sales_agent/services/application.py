@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sales_agent.adapters.channel import ConsoleChannelAdapter, KapsoWhatsAppAdapter
 from sales_agent.adapters.crm_memory import InMemoryCRMAdapter
 from sales_agent.adapters.crm_notion import NotionCRMAdapter
+from sales_agent.adapters.google_calendar import GoogleCalendarAdapter
 from sales_agent.adapters.memory_sql import SqlAlchemyMemoryStore
 from sales_agent.core.config import Settings
 from sales_agent.core.db import build_engine, build_session_factory, init_db
@@ -27,6 +28,7 @@ from sales_agent.domain.models import (
 )
 from sales_agent.graph.workflow import SalesAgentWorkflow
 from sales_agent.services.inbound_processor import DebouncedInboundProcessor
+from sales_agent.services.calendar_sync import enrich_contact_with_calendar, merge_contact_with_shadow
 from sales_agent.services.lead_scope import LeadScopedCRMTools
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
@@ -75,11 +77,13 @@ class SalesAgentApplication:
         self.prompt_store = PromptConfigStore(self.session_factory)
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self.crm_adapter = self._build_crm_adapter()
+        self.calendar_adapter = self._build_calendar_adapter()
         self.channel_adapter = self._build_channel_adapter()
         self.workflow = SalesAgentWorkflow(
             crm_adapter=self.crm_adapter,
             memory_store=self.memory_store,
             channel_adapter=self.channel_adapter,
+            calendar_adapter=self.calendar_adapter,
             planner=AgentPlanner(settings, prompt_store=self.prompt_store),
             policy=ToolExecutionPolicy(),
         )
@@ -122,14 +126,21 @@ class SalesAgentApplication:
         combined_text = "\n".join(part for part in (event.text.strip() for event in events) if part).strip() or anchor_event.text
 
         contact = await self.crm_adapter.find_contact_by_phone(anchor_event.phone_number)
+        shadow = await self.memory_store.get_contact_shadow(anchor_event.phone_number)
         lead_created = False
         if contact is None:
-            shadow = await self.memory_store.get_contact_shadow(anchor_event.phone_number)
             contact = await self.crm_adapter.create_contact(
                 phone_number=anchor_event.phone_number,
                 full_name=anchor_event.contact_name or (shadow.full_name if shadow else None),
             )
             lead_created = True
+        if shadow is not None:
+            contact = merge_contact_with_shadow(contact, shadow)
+        contact = await enrich_contact_with_calendar(
+            contact,
+            self.calendar_adapter,
+            self.settings.google_calendar_self_schedule_url,
+        )
 
         conversation_recent = await self.memory_store.get_recent_messages(anchor_event.conversation_id, limit=12)
         conversation_recent = [message for message in conversation_recent if message.message_id not in batch_message_ids]
@@ -167,7 +178,11 @@ class SalesAgentApplication:
         recent_texts = [message.text for message in prepared.recent_messages]
         combined_text = "\n".join(part for part in (event.text.strip() for event in prepared.events) if part).strip() or anchor_event.text
         tool_results: list[ToolExecutionResult] = []
-        scoped_tools = LeadScopedCRMTools(self.crm_adapter, current_lead) if current_lead is not None else None
+        scoped_tools = (
+            LeadScopedCRMTools(self.crm_adapter, current_lead, calendar_adapter=self.calendar_adapter)
+            if current_lead is not None
+            else None
+        )
 
         for action in planning.actions:
             try:
@@ -200,6 +215,14 @@ class SalesAgentApplication:
                         outcome=action.args.get("outcome"),
                     )
                     current_lead = scoped_tools.current_lead
+                elif action.type == ActionType.CREATE_MEETING and scoped_tools is not None:
+                    payload = await scoped_tools.create_meeting(
+                        start_iso=action.args["start_iso"],
+                        duration_minutes=int(action.args.get("duration_minutes", self.settings.google_calendar_default_meeting_minutes)),
+                        title=action.args["title"],
+                        description=action.args["description"],
+                    )
+                    current_lead = scoped_tools.current_lead
                 elif action.type == ActionType.HANDOFF_HUMAN:
                     payload = {"status": "requested"}
                 else:
@@ -207,6 +230,8 @@ class SalesAgentApplication:
                 tool_results.append(ToolExecutionResult(action=action, success=True, payload=payload))
             except Exception as exc:  # noqa: BLE001
                 tool_results.append(ToolExecutionResult(action=action, success=False, error=str(exc)))
+
+        prepared.response_text = self._finalize_response_text(prepared.response_text, tool_results, current_lead)
 
         if current_lead is not None:
             await self.memory_store.remember_contact(current_lead)
@@ -286,3 +311,43 @@ class SalesAgentApplication:
         if self.settings.kapso_api_token and self.settings.kapso_phone_number_id:
             return KapsoWhatsAppAdapter(self.settings)
         return ConsoleChannelAdapter()
+
+    def _build_calendar_adapter(self):
+        if (
+            self.settings.google_client_id
+            and self.settings.google_client_secret
+            and self.settings.google_refresh_token
+        ):
+            return GoogleCalendarAdapter(self.settings)
+        return None
+
+    def _finalize_response_text(
+        self,
+        response_text: str,
+        tool_results: list[ToolExecutionResult],
+        contact: CRMContact | None,
+    ) -> str:
+        final_text = response_text.strip()
+        created_meeting = next(
+            (
+                result.payload
+                for result in tool_results
+                if result.success and result.action.type == ActionType.CREATE_MEETING
+            ),
+            None,
+        )
+        if created_meeting:
+            start_iso = created_meeting.get("start_iso")
+            confirmation_lines = [
+                f"Listo. Ya te dejé la demo agendada para {start_iso}.",
+            ]
+            if created_meeting.get("meet_link"):
+                confirmation_lines.append(f"Link de Meet: {created_meeting['meet_link']}")
+            elif created_meeting.get("html_link"):
+                confirmation_lines.append(f"Detalle del evento: {created_meeting['html_link']}")
+            return "\n".join(confirmation_lines)
+
+        upcoming_event = (((contact.metadata if contact else {}) or {}).get("calendar") or {}).get("upcoming_event")
+        if upcoming_event and not final_text:
+            return f"Veo una demo futura agendada para {upcoming_event.get('start_iso')}."
+        return final_text

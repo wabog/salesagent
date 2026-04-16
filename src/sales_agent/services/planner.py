@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from textwrap import dedent
+from zoneinfo import ZoneInfo
 
 from openai import OpenAIError
 from langchain_openai import ChatOpenAI
@@ -136,6 +137,10 @@ class AgentPlanner:
             - Prefer 1 to 3 short sentences such as company context, current tool, pain points, urgency, and agreed next step.
             - Create a follow-up when a concrete next step or reminder is needed.
             - CREATE_FOLLOWUP summaries must be short operational reminders, not the raw user message.
+            - Use CREATE_MEETING only when the lead already confirmed a specific day and time for the demo or call.
+            - CREATE_MEETING must include `start_iso`, `duration_minutes`, `title`, and `description`.
+            - If there is a self-scheduling link available and the lead wants a demo but has not fixed a time, offer that link naturally.
+            - If the contact metadata already includes an upcoming calendar event, treat the demo as scheduled.
             - Never invent CRM data you do not have.
 
             Contact:
@@ -197,6 +202,12 @@ class AgentPlanner:
                 existing_outcome = str(args.get("outcome", "")).strip()
                 if not existing_outcome:
                     args["outcome"] = self._build_followup_completion_outcome(text)
+            if action.type == ActionType.CREATE_MEETING:
+                meeting_payload = self._build_meeting_payload(text, contact)
+                if meeting_payload:
+                    merged_payload = dict(meeting_payload)
+                    merged_payload.update({key: value for key, value in args.items() if value})
+                    args = merged_payload
             repaired_actions.append(action.model_copy(update={"args": args}))
         return result.model_copy(update={"actions": repaired_actions})
 
@@ -213,12 +224,18 @@ class AgentPlanner:
         notes = {action.args.get("note", "").strip() for action in actions if action.type == ActionType.APPEND_NOTE}
         has_followup = any(action.type == ActionType.CREATE_FOLLOWUP for action in actions)
         has_followup_completion = any(action.type == ActionType.COMPLETE_FOLLOWUP for action in actions)
-        completion_detected = self._should_complete_followup(lowered, contact)
+        has_meeting_creation = any(action.type == ActionType.CREATE_MEETING for action in actions)
+        upcoming_event = self._get_upcoming_calendar_event(contact)
+        completion_detected = self._should_complete_followup(lowered, contact) or (
+            upcoming_event is not None and bool(contact and contact.followup_summary)
+        )
         stage_index = next(
             (index for index, action in enumerate(actions) if action.type == ActionType.UPDATE_STAGE),
             None,
         )
         inferred_stage = self._infer_stage_from_text(text, current_stage, recent_messages or [])
+        if upcoming_event is not None:
+            inferred_stage = "Demo agendada"
         if inferred_stage and self._should_update_stage(current_stage, inferred_stage):
             stage_action = ProposedAction(
                 type=ActionType.UPDATE_STAGE,
@@ -239,17 +256,37 @@ class AgentPlanner:
                 )
             )
 
+        if upcoming_event is not None and not notes:
+            actions.append(
+                ProposedAction(
+                    type=ActionType.APPEND_NOTE,
+                    reason="El calendario ya muestra una demo futura para este lead.",
+                    args={"note": self._build_calendar_note(upcoming_event)},
+                )
+            )
+
         if completion_detected and not has_followup_completion:
             actions.append(
                 ProposedAction(
                     type=ActionType.COMPLETE_FOLLOWUP,
                     reason="La política comercial detectó que el siguiente paso vigente ya fue cumplido.",
-                    args={"outcome": self._build_followup_completion_outcome(text)},
+                    args={"outcome": self._build_followup_completion_outcome(text, upcoming_event=upcoming_event)},
                 )
             )
             has_followup_completion = True
 
-        if self._should_create_followup(lowered) and not has_followup and not completion_detected:
+        meeting_payload = self._build_meeting_payload(text, contact)
+        if meeting_payload and not has_meeting_creation and upcoming_event is None:
+            actions.append(
+                ProposedAction(
+                    type=ActionType.CREATE_MEETING,
+                    reason="El lead ya dio una fecha y hora concreta para la demo.",
+                    args=meeting_payload,
+                )
+            )
+            has_meeting_creation = True
+
+        if self._should_create_followup(lowered) and not has_followup and not completion_detected and not has_meeting_creation:
             actions.append(
                 ProposedAction(
                     type=ActionType.CREATE_FOLLOWUP,
@@ -261,7 +298,13 @@ class AgentPlanner:
                 )
             )
 
-        return result.model_copy(update={"actions": actions})
+        response_text = result.response_text
+        if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
+            response_text = self._append_self_schedule_link(response_text)
+        if upcoming_event is not None:
+            response_text = self._append_calendar_confirmation(response_text, upcoming_event)
+
+        return result.model_copy(update={"actions": actions, "response_text": response_text})
 
     def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
         lowered = text.lower()
@@ -470,6 +513,26 @@ class AgentPlanner:
             return (base_date + timedelta(days=1)).isoformat()
         return (base_date + timedelta(days=1)).isoformat()
 
+    def _build_meeting_payload(self, text: str, contact: CRMContact | None) -> dict[str, str | int] | None:
+        start_at = self._extract_requested_meeting_start(text)
+        if start_at is None:
+            return None
+        lead_label = (contact.full_name or "Lead").strip() if contact else "Lead"
+        description_parts = [
+            "Demo comercial creada por el agente de ventas de Wabog.",
+            f"Lead: {lead_label}.",
+        ]
+        if contact and contact.phone_number:
+            description_parts.append(f"Telefono: {contact.phone_number}.")
+        if contact and contact.email:
+            description_parts.append(f"Email: {contact.email}.")
+        return {
+            "start_iso": start_at.isoformat(),
+            "duration_minutes": self._settings.google_calendar_default_meeting_minutes,
+            "title": f"Demo Wabog - {lead_label}",
+            "description": " ".join(description_parts),
+        }
+
     def _extract_current_tool(self, text: str) -> str | None:
         patterns = (
             r"(?:herramienta|tool|app)\s+llamada\s+([A-Za-z0-9][A-Za-z0-9_-]*)",
@@ -575,6 +638,7 @@ class AgentPlanner:
         intent = "generic_reply"
         confidence = 0.55
         current_stage = contact.stage if contact and contact.stage else "Prospecto"
+        upcoming_event = self._get_upcoming_calendar_event(contact)
 
         def add_stage_change(stage: str, reason: str) -> None:
             nonlocal intent, confidence
@@ -653,7 +717,7 @@ class AgentPlanner:
                 ProposedAction(
                     type=ActionType.COMPLETE_FOLLOWUP,
                     reason="El lead indicó que ya se cumplió el siguiente paso pendiente.",
-                    args={"outcome": self._build_followup_completion_outcome(text)},
+                    args={"outcome": self._build_followup_completion_outcome(text, upcoming_event=upcoming_event)},
                 )
             )
             if intent == "generic_reply":
@@ -703,19 +767,30 @@ class AgentPlanner:
                     args={"note": self._build_sales_note(text, [])},
                 )
             )
-            actions.append(
-                ProposedAction(
-                    type=ActionType.CREATE_FOLLOWUP,
-                    reason="Hay que dar siguiente paso comercial después de pedir demo.",
-                    args={
-                        "summary": self._build_followup_summary(text, []),
-                        "due_date": self._infer_followup_due_date(text, []),
-                    },
+            meeting_payload = self._build_meeting_payload(text, contact)
+            if meeting_payload and upcoming_event is None:
+                actions.append(
+                    ProposedAction(
+                        type=ActionType.CREATE_MEETING,
+                        reason="El lead ya definió una fecha y hora concreta para la demo.",
+                        args=meeting_payload,
+                    )
                 )
-            )
-            response_lines.append(
-                "Perfecto. Tiene sentido coordinar una demo para mostrarte cómo Wabog puede ayudarte a gestionar y vender mejor tus servicios legales."
-            )
+                response_lines.append("Perfecto. Voy a dejar esa demo creada de una vez en el calendario.")
+            elif upcoming_event is None:
+                actions.append(
+                    ProposedAction(
+                        type=ActionType.CREATE_FOLLOWUP,
+                        reason="Hay que dar siguiente paso comercial después de pedir demo.",
+                        args={
+                            "summary": self._build_followup_summary(text, []),
+                            "due_date": self._infer_followup_due_date(text, []),
+                        },
+                    )
+                )
+                response_lines.append(
+                    "Perfecto. Tiene sentido coordinar una demo para mostrarte cómo Wabog puede ayudarte a gestionar y vender mejor tus servicios legales."
+                )
 
         if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
             if intent == "generic_reply":
@@ -752,10 +827,16 @@ class AgentPlanner:
                 "Perfecto. Soy el agente comercial de Wabog para abogados. Cuéntame cómo estás manejando hoy tus procesos o qué quieres mejorar, y te guío al siguiente paso."
             )
 
+        response_text = " ".join(response_lines)
+        if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
+            response_text = self._append_self_schedule_link(response_text)
+        if upcoming_event is not None:
+            response_text = self._append_calendar_confirmation(response_text, upcoming_event)
+
         return PlanningResult(
             intent=intent,
             confidence=confidence,
-            response_text=" ".join(response_lines),
+            response_text=response_text,
             actions=actions,
             should_reply=True,
         )
@@ -784,10 +865,82 @@ class AgentPlanner:
             return " ".join(part.capitalize() for part in parts)
         return None
 
-    def _build_followup_completion_outcome(self, text: str) -> str:
+    def _build_followup_completion_outcome(self, text: str, upcoming_event: dict | None = None) -> str:
+        if upcoming_event is not None:
+            return f"El lead ya tiene una demo agendada para {upcoming_event.get('start_iso')}."
         cleaned = re.sub(r"\s+", " ", text.strip())
         if not cleaned:
             return "Lead confirmó que el seguimiento se completó."
         if cleaned.endswith((".", "!", "?")):
             return cleaned
         return f"{cleaned}."
+
+    def _get_upcoming_calendar_event(self, contact: CRMContact | None) -> dict | None:
+        if contact is None:
+            return None
+        return ((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")
+
+    def _build_calendar_note(self, upcoming_event: dict) -> str:
+        return f"Ya existe una demo futura en calendario para el lead. Inicio: {upcoming_event.get('start_iso')}."
+
+    def _append_self_schedule_link(self, response_text: str) -> str:
+        link_line = f"Si te sirve, también puedes agendar directamente aquí: {self._settings.google_calendar_self_schedule_url}"
+        if link_line in response_text:
+            return response_text
+        return f"{response_text} {link_line}".strip()
+
+    def _append_calendar_confirmation(self, response_text: str, upcoming_event: dict) -> str:
+        confirmation = f"Veo en calendario una demo futura para {upcoming_event.get('start_iso')}."
+        if confirmation in response_text:
+            return response_text
+        return f"{response_text} {confirmation}".strip()
+
+    def _should_offer_self_schedule_link(self, lowered_text: str, upcoming_event: dict | None) -> bool:
+        if upcoming_event is not None:
+            return False
+        return any(
+            token in lowered_text
+            for token in (
+                "demo",
+                "agendar",
+                "agenda",
+                "reunión",
+                "reunion",
+                "llamada",
+                "calendario",
+                "link",
+                "horario",
+                "disponibilidad",
+            )
+        )
+
+    def _extract_requested_meeting_start(self, text: str) -> datetime | None:
+        lowered = text.lower()
+        if not any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+            return None
+        tz = ZoneInfo(self._settings.google_calendar_timezone)
+        base_date = datetime.now(tz).date()
+
+        relative_match = re.search(
+            r"\b(hoy|mañana|manana)\b(?:.*?)(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+            lowered,
+        )
+        if relative_match:
+            day_token, hour_raw, minute_raw, meridiem = relative_match.groups()
+            target_date = base_date if day_token == "hoy" else base_date + timedelta(days=1)
+            hour = int(hour_raw)
+            minute = int(minute_raw or "0")
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            elif meridiem is None and 1 <= hour <= 7:
+                hour += 12
+            return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+
+        isoish_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})[ t](\d{1,2}):(\d{2})\b", lowered)
+        if isoish_match:
+            date_raw, hour_raw, minute_raw = isoish_match.groups()
+            target_date = date.fromisoformat(date_raw)
+            return datetime(target_date.year, target_date.month, target_date.day, int(hour_raw), int(minute_raw), tzinfo=tz)
+        return None

@@ -11,6 +11,15 @@ def build_planner() -> AgentPlanner:
     return AgentPlanner(Settings(OPENAI_API_KEY=""))
 
 
+def build_planner_with_calendar_link() -> AgentPlanner:
+    return AgentPlanner(
+        Settings(
+            OPENAI_API_KEY="",
+            GOOGLE_CALENDAR_SELF_SCHEDULE_URL="https://calendar.app.google/9KpgMYTW4nA17LV27",
+        )
+    )
+
+
 def test_sales_policy_infers_trial_stage_note_and_followup_for_new_lead():
     planner = build_planner()
     result = PlanningResult(
@@ -212,6 +221,117 @@ def test_repair_actions_rewrites_followup_summary_when_it_is_raw_text():
     followup_action = next(action for action in repaired.actions if action.type == ActionType.CREATE_FOLLOWUP)
     assert followup_action.args["summary"] == "Coordinar fecha y hora para demo comercial."
     assert followup_action.args["due_date"] == (date.today() + timedelta(days=1)).isoformat()
+
+
+def test_build_meeting_payload_for_explicit_demo_time():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        email="lead@example.com",
+    )
+
+    payload = planner._build_meeting_payload(  # noqa: SLF001
+        "Agendemos la demo mañana a las 3 pm",
+        contact,
+    )
+
+    assert payload is not None
+    assert payload["duration_minutes"] == planner._settings.google_calendar_default_meeting_minutes  # noqa: SLF001
+    assert payload["title"] == "Demo Wabog - Lead Demo"
+    assert "lead@example.com" in payload["description"]
+
+
+def test_sales_policy_appends_self_schedule_link_for_demo_interest():
+    planner = build_planner_with_calendar_link()
+    result = PlanningResult(
+        intent="demo_interest",
+        confidence=0.8,
+        response_text="Perfecto. Coordinemos la demo.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "Quiero agendar una demo",
+        None,
+        [],
+    )
+
+    assert "calendar.app.google" in enforced.response_text
+
+
+def test_sales_policy_uses_upcoming_calendar_event_to_complete_followup():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        stage="Primer contacto",
+        followup_summary="Coordinar fecha y hora para demo comercial.",
+        followup_due_date=date(2026, 4, 17),
+        metadata={
+            "calendar": {
+                "upcoming_event": {
+                    "id": "evt-1",
+                    "start_iso": "2026-04-17T15:00:00-05:00",
+                }
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="generic_reply",
+        confidence=0.7,
+        response_text="Perfecto.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "hola",
+        contact,
+        [],
+    )
+
+    completion_action = next(action for action in enforced.actions if action.type == ActionType.COMPLETE_FOLLOWUP)
+    assert "2026-04-17T15:00:00-05:00" in completion_action.args["outcome"]
+    assert "demo futura" in enforced.response_text.lower()
+
+
+def test_sales_policy_does_not_complete_followup_twice_when_calendar_event_exists_but_followup_is_cleared():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        stage="Demo agendada",
+        followup_summary=None,
+        metadata={
+            "calendar": {
+                "upcoming_event": {
+                    "id": "evt-1",
+                    "start_iso": "2026-04-17T15:00:00-05:00",
+                }
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="generic_reply",
+        confidence=0.7,
+        response_text="Perfecto.",
+        actions=[],
+    )
+
+    enforced = planner._enforce_sales_policy(  # noqa: SLF001
+        result,
+        "hola",
+        contact,
+        [],
+    )
+
+    assert all(action.type != ActionType.COMPLETE_FOLLOWUP for action in enforced.actions)
+    assert "demo futura" in enforced.response_text.lower()
 
 
 def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
