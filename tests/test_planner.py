@@ -262,6 +262,25 @@ def test_build_meeting_payload_uses_recent_context_for_day_and_hour():
     assert "T09:00:00" in payload["start_iso"]
 
 
+def test_build_meeting_payload_uses_recent_afternoon_context_for_bare_hour():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        email="lead@example.com",
+    )
+
+    payload = planner._build_meeting_payload(  # noqa: SLF001
+        "a las 6",
+        contact,
+        ["Podemos agendar una demo el miércoles que viene en la tarde."],
+    )
+
+    assert payload is not None
+    assert "T18:00:00" in payload["start_iso"]
+
+
 def test_sales_policy_requests_name_and_email_before_creating_meeting():
     planner = build_planner()
     contact = CRMContact(
@@ -597,6 +616,31 @@ async def test_hard_rule_distinguishes_contact_source_questions():
     assert result.intent == "ask_contact_source"
     assert result.actions == []
     assert "te contactamos" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_hard_rule_returns_real_demo_link_when_upcoming_event_exists():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Carlos Ruiz",
+        metadata={
+            "calendar": {
+                "upcoming_event": {
+                    "id": "evt-1",
+                    "start_iso": "2026-04-21T18:00:00-05:00",
+                    "meet_link": "https://meet.google.com/abc-defg-hij",
+                }
+            }
+        },
+    )
+
+    result = await planner.plan("mandame el link por aqui", contact, [], [])
+
+    assert result.intent == "request_demo_link"
+    assert result.actions == []
+    assert "https://meet.google.com/abc-defg-hij" in result.response_text
 
 
 def test_append_calendar_confirmation_removes_unsupported_reminder_promise():

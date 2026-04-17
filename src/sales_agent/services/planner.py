@@ -175,6 +175,41 @@ class AgentPlanner:
 
     def _apply_hard_rules(self, text: str, contact: CRMContact | None) -> PlanningResult | None:
         normalized = self._normalize_lookup_text(text)
+        upcoming_event = self._get_upcoming_calendar_event(contact)
+        if self._is_demo_link_request(normalized):
+            if upcoming_event:
+                link = upcoming_event.get("meet_link") or upcoming_event.get("html_link")
+                if link:
+                    return PlanningResult(
+                        intent="request_demo_link",
+                        confidence=0.99,
+                        response_text=f"Aquí tienes el link de la demo: {link}",
+                        actions=[],
+                        should_reply=True,
+                    )
+                start_iso = upcoming_event.get("start_iso")
+                if start_iso:
+                    return PlanningResult(
+                        intent="request_demo_link",
+                        confidence=0.96,
+                        response_text=(
+                            f"Veo la demo agendada para {start_iso}, pero no tengo un link disponible para compartirte por aquí todavía."
+                        ),
+                        actions=[],
+                        should_reply=True,
+                    )
+            if contact and self._settings.google_calendar_self_schedule_url:
+                return PlanningResult(
+                    intent="request_demo_link",
+                    confidence=0.9,
+                    response_text=(
+                        "Todavía no veo una demo agendada con link para compartirte. "
+                        f"Si quieres, puedes agendarla aquí: {self._settings.google_calendar_self_schedule_url}"
+                    ),
+                    actions=[],
+                    should_reply=True,
+                )
+
         if normalized in {
             "como me llamo",
             "cual es mi nombre",
@@ -381,7 +416,11 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str] | None = None,
     ) -> PlanningResult:
-        actions = [action.model_copy(deep=True) for action in result.actions]
+        actions = [
+            action.model_copy(deep=True)
+            for action in result.actions
+            if not (action.type == ActionType.UPDATE_STAGE and not action.args.get("stage"))
+        ]
         recent_messages = recent_messages or []
         projected_contact = self._project_contact_for_actions(contact, actions, text)
         meeting_payload = self._build_meeting_payload(text, projected_contact, recent_messages)
@@ -1249,4 +1288,46 @@ class AgentPlanner:
             elif meridiem == "am" and hour == 12:
                 hour = 0
             return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+
+        bare_hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\b", lowered)
+        if weekday_match and bare_hour_match:
+            weekday_name = weekday_match.group(1)
+            weekday = weekday_map[weekday_name]
+            days_ahead = (weekday - base_date.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target_date = base_date + timedelta(days=days_ahead)
+            hour_raw, minute_raw = bare_hour_match.groups()
+            hour = int(hour_raw)
+            minute = int(minute_raw or "0")
+            if any(token in lowered for token in ("tarde", "pm", "noche")) and 1 <= hour <= 11:
+                hour += 12
+            elif "mañana" in lowered and hour == 12:
+                hour = 0
+            elif hour == 12 and "mediodia" not in lowered and "medio dia" not in lowered and "tarde" not in lowered:
+                hour = 12
+            return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
         return None
+
+    def _is_demo_link_request(self, normalized_text: str) -> bool:
+        return any(
+            phrase in normalized_text
+            for phrase in (
+                "mandame el link",
+                "mandame el enlace",
+                "pasame el link",
+                "pasame el enlace",
+                "enviame el link",
+                "enviame el enlace",
+                "me mandas el link",
+                "me mandas el enlace",
+                "dame el link",
+                "dame el enlace",
+                "link de la demo",
+                "enlace de la demo",
+                "link del meet",
+                "enlace del meet",
+                "no me mandaste nada",
+                "no la veo",
+            )
+        )
