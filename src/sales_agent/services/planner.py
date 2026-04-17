@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import ActionType
 from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
+from sales_agent.services.name_validation import contact_has_reliable_name, get_name_confirmation_candidate, is_specific_person_name
 from sales_agent.services.prompt_store import DEFAULT_BUSINESS_PROMPT
 
 
@@ -129,6 +130,8 @@ class AgentPlanner:
             - Move a lead to `Demo agendada` only when there is a concrete date and time or the contact already has an upcoming calendar event.
             - If the lead wants a demo but there is no exact slot yet, keep pushing to the next step without pretending it is booked.
             - Before creating a meeting, make sure you have the lead full name and email if those fields are missing.
+            - Treat placeholder names such as "user", "usuario", phone numbers, or unconfirmed provider names as missing names.
+            - If the current lead has a candidate name that still needs confirmation, ask to confirm it before using it as final.
             - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
             - Reuse recent conversation context aggressively. If the last user message only confirms something like "si, agenda", "martes a las 9", or "dale", combine it with prior turns before deciding actions.
             - If a prior turn already gave the day or hour for a demo and the current turn confirms it, create the meeting immediately when contact data is sufficient.
@@ -218,8 +221,11 @@ class AgentPlanner:
             "como me tienes guardado",
         }:
             full_name = (contact.full_name or "").strip() if contact else ""
-            if self._is_specific_contact_name(full_name, contact.phone_number if contact else None):
+            candidate_name = get_name_confirmation_candidate(contact)
+            if contact_has_reliable_name(contact):
                 response_text = f"Te tengo registrado como {full_name}."
+            elif candidate_name:
+                response_text = f"Te tengo como {candidate_name}, pero prefiero confirmarlo contigo. ¿Ese es tu nombre?"
             else:
                 response_text = "Todavía no tengo tu nombre registrado. Si quieres, compártemelo y lo guardo."
             return PlanningResult(
@@ -401,7 +407,7 @@ class AgentPlanner:
 
         response_text = result.response_text
         if meeting_payload and missing_meeting_fields and upcoming_event is None:
-            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields)
+            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields, contact)
         if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
             response_text = self._append_self_schedule_link(response_text)
         if upcoming_event is not None:
@@ -484,7 +490,7 @@ class AgentPlanner:
         if meeting_payload and not missing_meeting_fields and upcoming_event is None:
             response_text = "Perfecto. Voy a agendar la demo ahora mismo."
         elif meeting_payload and missing_meeting_fields and upcoming_event is None:
-            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields)
+            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields, projected_contact)
 
         if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
@@ -611,7 +617,7 @@ class AgentPlanner:
         value_digits = re.sub(r"\D", "", value or "")
         if phone_digits and value_digits and (phone_digits.endswith(value_digits) or value_digits.endswith(phone_digits)):
             return False
-        return normalized not in {"~", "-", "lead", "usuario", "user", "playground user", "sin nombre"}
+        return is_specific_person_name(value)
 
     def _project_contact_for_actions(
         self,
@@ -762,7 +768,7 @@ class AgentPlanner:
         start_at = self._extract_requested_meeting_start(text, recent_messages)
         if start_at is None:
             return None
-        lead_label = (contact.full_name or "Lead").strip() if contact else "Lead"
+        lead_label = (contact.full_name or "Lead").strip() if contact and contact_has_reliable_name(contact) else "Lead"
         description_parts = [
             "Demo comercial creada por el agente de ventas de Wabog.",
             f"Lead: {lead_label}.",
@@ -831,14 +837,20 @@ class AgentPlanner:
         if contact is None:
             return ["full_name", "email"]
         missing: list[str] = []
-        if not (contact.full_name or "").strip():
+        if not contact_has_reliable_name(contact):
             missing.append("full_name")
         if not (contact.email or "").strip():
             missing.append("email")
         return missing
 
-    def _build_missing_meeting_fields_response(self, missing_fields: list[str]) -> str:
+    def _build_missing_meeting_fields_response(self, missing_fields: list[str], contact: CRMContact | None = None) -> str:
+        candidate_name = get_name_confirmation_candidate(contact)
         if missing_fields == ["full_name", "email"]:
+            if candidate_name:
+                return (
+                    f"Perfecto. Antes de dejarte la demo agendada, ¿tu nombre es {candidate_name}? "
+                    "Y de una vez compárteme también tu correo para enviarte la invitación."
+                )
             return (
                 "Perfecto. Para dejarte la demo agendada y enviarte la invitación, "
                 "compárteme tu nombre completo y tu correo."
@@ -846,6 +858,8 @@ class AgentPlanner:
         if missing_fields == ["email"]:
             return "Perfecto. Para enviarte la invitación de la demo, compárteme tu correo."
         if missing_fields == ["full_name"]:
+            if candidate_name:
+                return f"Perfecto. Antes de agendarla, ¿tu nombre es {candidate_name}? Si no, compárteme tu nombre completo."
             return "Perfecto. Antes de agendarla, compárteme tu nombre completo."
         return (
             "Perfecto. Antes de dejar la demo agendada, compárteme los datos que me faltan "
@@ -1068,7 +1082,7 @@ class AgentPlanner:
                 )
                 response_lines.append("Perfecto. Voy a dejar esa demo creada de una vez en el calendario.")
             elif meeting_payload and missing_meeting_fields:
-                response_lines.append(self._build_missing_meeting_fields_response(missing_meeting_fields))
+                response_lines.append(self._build_missing_meeting_fields_response(missing_meeting_fields, contact))
             elif upcoming_event is None:
                 actions.append(
                     ProposedAction(

@@ -30,6 +30,12 @@ from sales_agent.graph.workflow import SalesAgentWorkflow
 from sales_agent.services.inbound_processor import DebouncedInboundProcessor
 from sales_agent.services.calendar_sync import enrich_contact_with_calendar, merge_contact_with_shadow
 from sales_agent.services.lead_scope import LeadScopedCRMTools
+from sales_agent.services.name_validation import (
+    ContactNameValidator,
+    apply_name_validation_metadata,
+    build_trusted_name_assessment,
+    contact_has_reliable_name,
+)
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
 from sales_agent.services.prompt_store import PromptConfigStore
@@ -79,6 +85,7 @@ class SalesAgentApplication:
         self.session_factory: async_sessionmaker[AsyncSession] = build_session_factory(self.engine)
         self.memory_store = SqlAlchemyMemoryStore(self.session_factory)
         self.prompt_store = PromptConfigStore(self.session_factory)
+        self.name_validator = ContactNameValidator(settings)
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self.crm_adapter = self._build_crm_adapter()
         self.calendar_adapter = self._build_calendar_adapter()
@@ -129,17 +136,29 @@ class SalesAgentApplication:
         batch_message_ids = {event.message_id for event in events}
         combined_text = "\n".join(part for part in (event.text.strip() for event in events) if part).strip() or anchor_event.text
 
+        provider_name_assessment = await self.name_validator.assess_provider_name(anchor_event.contact_name)
+        trusted_provider_name = (
+            provider_name_assessment.normalized_name if provider_name_assessment.status == "trusted" else None
+        )
+
         contact = await self.crm_adapter.find_contact_by_phone(anchor_event.phone_number)
         shadow = await self.memory_store.get_contact_shadow(anchor_event.phone_number)
         lead_created = False
         if contact is None:
             contact = await self.crm_adapter.create_contact(
                 phone_number=anchor_event.phone_number,
-                full_name=anchor_event.contact_name or (shadow.full_name if shadow else None),
+                full_name=trusted_provider_name or (shadow.full_name if shadow else None),
             )
             lead_created = True
         if shadow is not None:
             contact = merge_contact_with_shadow(contact, shadow)
+        if trusted_provider_name and not contact_has_reliable_name(contact):
+            contact = await self.crm_adapter.update_contact_fields(
+                contact.external_id,
+                {"full_name": trusted_provider_name},
+            )
+        if provider_name_assessment.status != "rejected":
+            contact = apply_name_validation_metadata(contact, provider_name_assessment)
         contact = await enrich_contact_with_calendar(
             contact,
             self.calendar_adapter,
@@ -211,6 +230,14 @@ class SalesAgentApplication:
                     current_lead = await scoped_tools.update_stage(action.args["stage"])
                     payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.UPDATE_CONTACT_FIELDS and scoped_tools is not None:
+                    if "full_name" in action.args.get("fields", {}) and current_lead is not None:
+                        current_lead = apply_name_validation_metadata(
+                            current_lead,
+                            build_trusted_name_assessment(
+                                action.args["fields"]["full_name"],
+                                source="user_message",
+                            ),
+                        )
                     current_lead = await scoped_tools.update_fields(action.args["fields"])
                     payload = current_lead.model_dump(mode="json")
                 elif action.type == ActionType.APPEND_NOTE and scoped_tools is not None:

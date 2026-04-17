@@ -593,6 +593,31 @@ async def test_hard_rule_asks_for_name_when_contact_name_is_missing_or_placehold
 
 
 @pytest.mark.asyncio
+async def test_hard_rule_asks_to_confirm_candidate_name_when_it_is_not_trusted_yet():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name=None,
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Juan",
+                "normalized_name": "Juan",
+                "confidence": 0.62,
+                "source": "provider",
+            }
+        },
+    )
+
+    result = await planner.plan("como me llamo", contact, [], [])
+
+    assert result.intent == "ask_name"
+    assert "juan" in result.response_text.lower()
+    assert "confirmarlo" in result.response_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_hard_rule_does_not_treat_phone_number_as_contact_name():
     planner = build_planner()
     contact = CRMContact(
@@ -653,6 +678,28 @@ def test_append_calendar_confirmation_removes_unsupported_reminder_promise():
 
     assert "recordatorio" not in response_text.lower()
     assert "veo en calendario una demo futura" in response_text.lower()
+
+
+def test_missing_meeting_fields_response_confirms_candidate_name_before_booking():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        email="lead@example.com",
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Juan",
+                "normalized_name": "Juan",
+                "confidence": 0.62,
+                "source": "provider",
+            }
+        },
+    )
+
+    response = planner._build_missing_meeting_fields_response(["full_name"], contact)  # noqa: SLF001
+
+    assert "tu nombre es Juan" in response
 
 
 def test_sales_policy_does_not_complete_followup_for_future_reminder_request():
