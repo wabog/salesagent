@@ -8,7 +8,10 @@ from httpx import ASGITransport, AsyncClient
 
 from sales_agent.api.app import create_app
 from sales_agent.core.config import Settings
+from sales_agent.core.db import PromptConfigRecord
 from sales_agent.domain.models import ConversationMessage, Direction, InboundMessage
+from sales_agent.services.media_preprocessor import MediaPreprocessingResult
+from sales_agent.services.prompt_store import DEFAULT_BUSINESS_PROMPT, LEGACY_DEFAULT_BUSINESS_PROMPT, PROMPT_KEY
 
 
 @pytest.mark.asyncio
@@ -65,7 +68,7 @@ async def test_webhook_ignores_non_message_events():
     assert webhook.status_code == 200
     assert webhook.json()["accepted"] is False
     assert webhook.json()["render_reply"] is False
-    assert "text content" in webhook.json()["ignored_reason"]
+    assert "supported inbound content" in webhook.json()["ignored_reason"]
 
 
 @pytest.mark.asyncio
@@ -259,6 +262,65 @@ async def test_playground_prompt_config_can_save_and_publish_draft():
 
 
 @pytest.mark.asyncio
+async def test_playground_prompt_publish_uses_current_editor_value_without_prior_save():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            published = await client.post(
+                "/playground/prompt-config/publish",
+                json={"business_prompt": "Texto publicado directo desde el editor."},
+            )
+            draft = await client.get("/playground/prompt-config", params={"mode": "draft"})
+            published_state = await client.get("/playground/prompt-config", params={"mode": "published"})
+
+    assert published.status_code == 200
+    assert published.json()["draft_business_prompt"] == "Texto publicado directo desde el editor."
+    assert published.json()["published_business_prompt"] == "Texto publicado directo desde el editor."
+    assert draft.json()["active_business_prompt"] == "Texto publicado directo desde el editor."
+    assert published_state.json()["active_business_prompt"] == "Texto publicado directo desde el editor."
+
+
+@pytest.mark.asyncio
+async def test_playground_prompt_config_migrates_legacy_default_prompt():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with app.state.sales_agent.session_factory() as session:
+            session.add(
+                PromptConfigRecord(
+                    prompt_key=PROMPT_KEY,
+                    draft_business_prompt=LEGACY_DEFAULT_BUSINESS_PROMPT,
+                    published_business_prompt=LEGACY_DEFAULT_BUSINESS_PROMPT,
+                )
+            )
+            await session.commit()
+
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            config = await client.get("/playground/prompt-config")
+
+    assert config.status_code == 200
+    assert config.json()["draft_business_prompt"] == DEFAULT_BUSINESS_PROMPT
+    assert config.json()["published_business_prompt"] == DEFAULT_BUSINESS_PROMPT
+
+
+@pytest.mark.asyncio
 async def test_prepare_batched_run_reuses_recent_messages_from_same_phone_across_conversations():
     app = create_app(
         Settings(
@@ -399,3 +461,78 @@ async def test_prepare_batched_run_ignores_other_phone_messages_inside_same_conv
 
     recent_texts = [message.text for message in prepared.recent_messages]
     assert "Necesito una demo para mi despacho." not in recent_texts
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_document_only_uses_canned_reply(monkeypatch):
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async def fake_preprocess(event: InboundMessage) -> MediaPreprocessingResult:
+        return MediaPreprocessingResult(
+            bypass_intent="document_unsupported",
+            bypass_response_text="document unsupported",
+        )
+
+    async with app.router.lifespan_context(app):
+        monkeypatch.setattr(app.state.sales_agent.media_preprocessor, "preprocess_event", fake_preprocess)
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="doc-1",
+                    conversation_id="conv-doc",
+                    phone_number="3156832600",
+                    text="",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                    message_type="document",
+                )
+            ]
+        )
+
+    assert prepared.planning.intent == "document_unsupported"
+    assert prepared.planning.should_reply is True
+    assert "no puedo procesar documentos" in prepared.response_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_sticker_only_skips_reply(monkeypatch):
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async def fake_preprocess(event: InboundMessage) -> MediaPreprocessingResult:
+        return MediaPreprocessingResult(should_reply=False)
+
+    async with app.router.lifespan_context(app):
+        monkeypatch.setattr(app.state.sales_agent.media_preprocessor, "preprocess_event", fake_preprocess)
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="sticker-1",
+                    conversation_id="conv-sticker",
+                    phone_number="3156832601",
+                    text="",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                    message_type="sticker",
+                )
+            ]
+        )
+
+    assert prepared.planning.intent == "non_text_ignored"
+    assert prepared.planning.should_reply is False
+    assert prepared.response_text == ""

@@ -70,6 +70,69 @@ def _extract_text(message: dict[str, Any], conversation: dict[str, Any]) -> str:
     return str(text).strip()
 
 
+def _extract_media_url(message: dict[str, Any], message_type: str) -> str | None:
+    kapso = _as_dict(message.get("kapso"))
+    media_data = _pick_first_dict(kapso.get("media_data"), kapso.get("message_type_data"))
+    type_payload = _as_dict(message.get(message_type))
+    value = (
+        kapso.get("media_url")
+        or media_data.get("download_url")
+        or media_data.get("url")
+        or type_payload.get("link")
+        or type_payload.get("url")
+        or message.get("media_url")
+    )
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _extract_media_filename(message: dict[str, Any], message_type: str) -> str | None:
+    kapso = _as_dict(message.get("kapso"))
+    media_data = _pick_first_dict(kapso.get("media_data"), kapso.get("message_type_data"))
+    type_payload = _as_dict(message.get(message_type))
+    value = type_payload.get("filename") or media_data.get("filename") or media_data.get("name")
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _extract_media_content_type(message: dict[str, Any], message_type: str) -> str | None:
+    kapso = _as_dict(message.get("kapso"))
+    media_data = _pick_first_dict(kapso.get("media_data"), kapso.get("message_type_data"))
+    type_payload = _as_dict(message.get(message_type))
+    value = type_payload.get("mime_type") or media_data.get("mime_type") or media_data.get("content_type")
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _extract_media_caption(message: dict[str, Any], message_type: str) -> str | None:
+    kapso = _as_dict(message.get("kapso"))
+    type_payload = _as_dict(message.get(message_type))
+    value = type_payload.get("caption") or kapso.get("caption")
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _extract_transcript(message: dict[str, Any]) -> str | None:
+    kapso = _as_dict(message.get("kapso"))
+    transcript = kapso.get("transcript")
+    if isinstance(transcript, dict):
+        value = transcript.get("text")
+    else:
+        value = transcript
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def normalize_kapso_payload(payload: dict) -> InboundMessage:
     body = _as_dict(payload.get("body"))
     data = _as_dict(payload.get("data"))
@@ -90,9 +153,17 @@ def normalize_kapso_payload(payload: dict) -> InboundMessage:
     if not message:
         raise KapsoPayloadError("Kapso payload does not contain a supported message object.")
 
+    message_type = str(message.get("type") or _as_dict(message.get("kapso")).get("message_type") or "text").strip().lower()
     text = _extract_text(message, conversation)
-    if not text:
-        raise KapsoPayloadError("Kapso payload does not contain inbound text content.")
+    media_url = _extract_media_url(message, message_type)
+    media_filename = _extract_media_filename(message, message_type)
+    media_content_type = _extract_media_content_type(message, message_type)
+    media_caption = _extract_media_caption(message, message_type)
+    media_transcript = _extract_transcript(message)
+    if not text and not any((media_url, media_caption, media_transcript)) and message_type == "text":
+        raise KapsoPayloadError("Kapso payload does not contain supported inbound content.")
+    if not text and message_type not in {"audio", "image", "document", "sticker", "video"}:
+        raise KapsoPayloadError("Kapso payload does not contain supported inbound content.")
 
     message_id = (
         message.get("id")
@@ -130,5 +201,11 @@ def normalize_kapso_payload(payload: dict) -> InboundMessage:
         text=text,
         timestamp=timestamp,
         raw_payload=payload,
+        message_type=message_type,
+        media_url=media_url,
+        media_content_type=media_content_type,
+        media_filename=media_filename,
+        media_caption=media_caption,
+        media_transcript=media_transcript,
         contact_name=conversation.get("contact_name") or conversation.get("name"),
     )

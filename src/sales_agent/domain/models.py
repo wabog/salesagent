@@ -44,6 +44,12 @@ class InboundMessage(BaseModel):
     text: str
     timestamp: datetime
     raw_payload: dict[str, Any]
+    message_type: str = "text"
+    media_url: str | None = None
+    media_content_type: str | None = None
+    media_filename: str | None = None
+    media_caption: str | None = None
+    media_transcript: str | None = None
     channel: Channel = Channel.WHATSAPP
     provider: str = "kapso"
     contact_name: str | None = None

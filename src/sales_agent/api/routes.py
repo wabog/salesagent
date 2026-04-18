@@ -499,7 +499,7 @@ async def playground(request: Request, token: str | None = None) -> str:
         updatePrompt("Guardando draft...", "/playground/prompt-config", "PUT", { business_prompt: businessPrompt.value })
       );
       document.getElementById("publishPrompt").addEventListener("click", () =>
-        updatePrompt("Publicando draft...", "/playground/prompt-config/publish", "POST")
+        updatePrompt("Publicando draft...", "/playground/prompt-config/publish", "POST", { business_prompt: businessPrompt.value })
       );
       document.getElementById("resetPrompt").addEventListener("click", () =>
         updatePrompt("Reseteando draft...", "/playground/prompt-config/reset-draft", "POST")
@@ -555,9 +555,12 @@ async def save_prompt_config(
 @router.post("/playground/prompt-config/publish")
 async def publish_prompt_config(
     request: Request,
+    payload: PromptConfigPayload | None = None,
     x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
 ) -> dict:
     _require_playground_access(request, x_playground_token)
+    if payload is not None:
+        await request.app.state.sales_agent.save_prompt_draft(payload.business_prompt)
     return await request.app.state.sales_agent.publish_prompt_draft()
 
 

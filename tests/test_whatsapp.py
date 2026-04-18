@@ -43,7 +43,38 @@ def test_normalize_kapso_payload_from_data_wrapper():
     assert event.contact_name == "Fabian"
 
 
-def test_normalize_kapso_payload_rejects_non_text_payload():
+def test_normalize_kapso_payload_audio_extracts_media_metadata():
+    payload = {
+        "event": "message.received",
+        "body": {
+            "message": {
+                "id": "msg-audio",
+                "from": "573001112233",
+                "timestamp": "1775704462",
+                "type": "audio",
+                "kapso": {
+                    "content": "[Audio attached]",
+                    "media_url": "https://api.kapso.ai/media/audio-1",
+                    "transcript": {"text": "Necesito una demo"},
+                },
+                "audio": {"mime_type": "audio/ogg"},
+            },
+            "conversation": {
+                "id": "conv-audio",
+                "phone_number": "573001112233",
+            },
+        },
+    }
+
+    event = normalize_kapso_payload(payload)
+
+    assert event.message_type == "audio"
+    assert event.media_url == "https://api.kapso.ai/media/audio-1"
+    assert event.media_content_type == "audio/ogg"
+    assert event.media_transcript == "Necesito una demo"
+
+
+def test_normalize_kapso_payload_rejects_unsupported_payload():
     payload = {
         "event": "message.status",
         "data": {
@@ -54,5 +85,5 @@ def test_normalize_kapso_payload_rejects_non_text_payload():
         },
     }
 
-    with pytest.raises(KapsoPayloadError, match="text content"):
+    with pytest.raises(KapsoPayloadError, match="supported inbound content"):
         normalize_kapso_payload(payload)

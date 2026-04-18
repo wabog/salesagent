@@ -4,12 +4,15 @@ import httpx
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.phones import phone_to_provider_digits
-from sales_agent.domain.models import OutboundMessage
+from sales_agent.domain.models import InboundMessage, OutboundMessage
 
 
 class ConsoleChannelAdapter:
     async def send_text(self, message: OutboundMessage) -> dict:
         return {"provider": "console", "status": "skipped", "text": message.text}
+
+    async def send_typing_indicator(self, event: InboundMessage) -> dict:
+        return {"provider": "console", "status": "skipped", "message_id": event.message_id}
 
 
 class KapsoWhatsAppAdapter:
@@ -31,6 +34,25 @@ class KapsoWhatsAppAdapter:
             ),
             "type": "text",
             "text": {"body": message.text},
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                url,
+                headers={"X-API-Key": self._settings.kapso_api_token},
+                json=body,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def send_typing_indicator(self, event: InboundMessage) -> dict:
+        if not self._settings.whatsapp_send_enabled:
+            return {"provider": "kapso", "status": "disabled", "message_id": event.message_id}
+        url = f"{self._settings.kapso_base_url}/meta/whatsapp/v24.0/{self._settings.kapso_phone_number_id}/messages"
+        body = {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": event.message_id,
+            "typing_indicator": {"type": "text"},
         }
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
