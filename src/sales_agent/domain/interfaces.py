@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, OutboundMessage, ToolExecutionResult
+from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, KnowledgeLookup, OutboundMessage, ToolExecutionResult
 
 
 class CRMAdapter(Protocol):
@@ -45,6 +45,7 @@ class MemoryStore(Protocol):
         intent: str,
         response_text: str,
         tool_results: list[ToolExecutionResult],
+        knowledge_lookups: list[KnowledgeLookup],
     ) -> None: ...
 
 

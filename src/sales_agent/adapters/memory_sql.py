@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from sales_agent.core.db import AgentRunRecord, ContactShadowRecord, ConversationThreadRecord, MessageRecord
 from sales_agent.domain.phones import normalize_phone_number
-from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, ToolExecutionResult
+from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, KnowledgeLookup, ToolExecutionResult
 
 
 class SqlAlchemyMemoryStore:
@@ -182,6 +182,7 @@ class SqlAlchemyMemoryStore:
         intent: str,
         response_text: str,
         tool_results: list[ToolExecutionResult],
+        knowledge_lookups: list[KnowledgeLookup],
     ) -> None:
         for _ in range(2):
             async with self._session_factory() as session:
@@ -194,6 +195,7 @@ class SqlAlchemyMemoryStore:
                         intent=intent,
                         response_text=response_text,
                         tool_results_json=[result.model_dump(mode="json") for result in tool_results],
+                        knowledge_lookups_json=[lookup.model_dump(mode="json") for lookup in knowledge_lookups],
                     )
                 )
                 thread = await session.get(ConversationThreadRecord, event.conversation_id)

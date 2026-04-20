@@ -168,7 +168,6 @@ class SalesAgentWorkflow:
             contact=state["current_lead"],
             recent_messages=[message["text"] for message in state["recent_messages"]],
             semantic_memories=state["semantic_memories"],
-            prompt_mode=state["event"].prompt_mode,
         )
         state["planning"] = planning
         state["response_text"] = planning.response_text.strip()
@@ -266,6 +265,7 @@ class SalesAgentWorkflow:
             intent=state["planning"].intent,
             response_text=state["response_text"],
             tool_results=state["tool_results"],
+            knowledge_lookups=state["planning"].knowledge_lookups,
         )
         state["persisted"] = True
         return state

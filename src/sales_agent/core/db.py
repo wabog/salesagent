@@ -48,6 +48,7 @@ class AgentRunRecord(Base):
     intent: Mapped[str] = mapped_column(String(128))
     response_text: Mapped[str] = mapped_column(Text())
     tool_results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    knowledge_lookups_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
@@ -62,16 +63,6 @@ class ContactShadowRecord(Base):
     notes_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-
-
-class PromptConfigRecord(Base):
-    __tablename__ = "prompt_configs"
-
-    prompt_key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    draft_business_prompt: Mapped[str] = mapped_column(Text())
-    published_business_prompt: Mapped[str] = mapped_column(Text())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 def build_engine(database_url: str) -> AsyncEngine:

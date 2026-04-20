@@ -2,8 +2,7 @@ import pytest
 from datetime import date, timedelta
 
 from sales_agent.core.config import Settings
-from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
-from sales_agent.domain.models import ActionType
+from sales_agent.domain.models import ActionType, CRMContact, PlanningResult, ProposedAction
 from sales_agent.services.planner import AgentPlanner
 
 
@@ -749,18 +748,24 @@ class _FakeStructuredOutput:
         return _Response()
 
 
-class _FakePromptStore:
-    async def get_business_prompt(self, mode: PromptMode) -> str:
-        return "DRAFT brief." if mode == PromptMode.DRAFT else "PUBLISHED brief."
+class _FakeKnowledgeSelector:
+    async def ainvoke(self, prompt: str):
+        class _Response:
+            def model_dump(self_nonlocal):  # noqa: ANN001
+                return {
+                    "section_names": ["wabog_pricing"],
+                    "reason": "Pricing question.",
+                }
+
+        return _Response()
 
 
 @pytest.mark.asyncio
-async def test_planner_uses_prompt_mode_to_load_editable_business_prompt():
-    planner = AgentPlanner(Settings(OPENAI_API_KEY=""), prompt_store=_FakePromptStore())
+async def test_planner_loads_selected_knowledge_section_into_prompt():
+    planner = AgentPlanner(Settings(OPENAI_API_KEY=""))
     planner._llm = _FakeStructuredOutput()  # noqa: SLF001
+    planner._knowledge_selector_llm = _FakeKnowledgeSelector()  # noqa: SLF001
 
-    await planner.plan("hola", None, [], [], prompt_mode=PromptMode.DRAFT)
-    assert "DRAFT brief." in planner._llm.last_prompt  # noqa: SLF001
-
-    await planner.plan("hola", None, [], [], prompt_mode=PromptMode.PUBLISHED)
-    assert "PUBLISHED brief." in planner._llm.last_prompt  # noqa: SLF001
+    result = await planner.plan("y eso cuanto vale", None, [], [])
+    assert "Wabog Pricing" in planner._llm.last_prompt  # noqa: SLF001
+    assert any(item.section == "wabog_pricing" for item in result.knowledge_lookups)

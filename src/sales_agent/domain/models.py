@@ -21,12 +21,6 @@ class Direction(StrEnum):
     INBOUND = "inbound"
     OUTBOUND = "outbound"
 
-
-class PromptMode(StrEnum):
-    PUBLISHED = "published"
-    DRAFT = "draft"
-
-
 class ActionType(StrEnum):
     UPDATE_STAGE = "update_stage"
     UPDATE_CONTACT_FIELDS = "update_contact_fields"
@@ -53,7 +47,6 @@ class InboundMessage(BaseModel):
     channel: Channel = Channel.WHATSAPP
     provider: str = "kapso"
     contact_name: str | None = None
-    prompt_mode: PromptMode = PromptMode.PUBLISHED
 
     @field_validator("phone_number", mode="before")
     @classmethod
@@ -112,12 +105,18 @@ class ProposedAction(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
+class KnowledgeLookup(BaseModel):
+    section: str
+    reason: str
+
+
 class PlanningResult(BaseModel):
     intent: str
     confidence: float = 0.0
     response_text: str
     actions: list[ProposedAction] = Field(default_factory=list)
     should_reply: bool = True
+    knowledge_lookups: list[KnowledgeLookup] = Field(default_factory=list)
 
 
 class ToolExecutionResult(BaseModel):

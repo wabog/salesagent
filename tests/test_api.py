@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from sales_agent.api.app import create_app
 from sales_agent.core.config import Settings
-from sales_agent.core.db import PromptConfigRecord
+from sales_agent.core.db import AgentRunRecord
 from sales_agent.domain.models import ConversationMessage, Direction, InboundMessage
 from sales_agent.services.media_preprocessor import MediaPreprocessingResult
-from sales_agent.services.prompt_store import DEFAULT_BUSINESS_PROMPT, LEGACY_DEFAULT_BUSINESS_PROMPT, PROMPT_KEY
 
 
 @pytest.mark.asyncio
@@ -229,7 +229,7 @@ async def test_local_chat_batches_quick_messages_into_one_reply():
 
 
 @pytest.mark.asyncio
-async def test_playground_prompt_config_can_save_and_publish_draft():
+async def test_playground_agent_context_exposes_repo_backed_prompt_files():
     app = create_app(
         Settings(
             DATABASE_URL="sqlite+aiosqlite:///:memory:",
@@ -242,82 +242,15 @@ async def test_playground_prompt_config_can_save_and_publish_draft():
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-            initial = await client.get("/playground/prompt-config")
-            saved = await client.put(
-                "/playground/prompt-config",
-                json={"business_prompt": "Nuevo brief comercial para playground."},
-            )
-            draft = await client.get("/playground/prompt-config", params={"mode": "draft"})
-            published_before = await client.get("/playground/prompt-config", params={"mode": "published"})
-            published = await client.post("/playground/prompt-config/publish")
+            context = await client.get("/playground/agent-context")
 
-    assert initial.status_code == 200
-    assert "core_prompt" in initial.json()
-    assert saved.status_code == 200
-    assert saved.json()["draft_business_prompt"] == "Nuevo brief comercial para playground."
-    assert draft.json()["active_business_prompt"] == "Nuevo brief comercial para playground."
-    assert published_before.json()["active_business_prompt"] != "Nuevo brief comercial para playground."
-    assert published.status_code == 200
-    assert published.json()["published_business_prompt"] == "Nuevo brief comercial para playground."
-
-
-@pytest.mark.asyncio
-async def test_playground_prompt_publish_uses_current_editor_value_without_prior_save():
-    app = create_app(
-        Settings(
-            DATABASE_URL="sqlite+aiosqlite:///:memory:",
-            OPENAI_API_KEY="",
-            CRM_BACKEND="memory",
-            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
-        )
-    )
-    transport = ASGITransport(app=app)
-
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-            published = await client.post(
-                "/playground/prompt-config/publish",
-                json={"business_prompt": "Texto publicado directo desde el editor."},
-            )
-            draft = await client.get("/playground/prompt-config", params={"mode": "draft"})
-            published_state = await client.get("/playground/prompt-config", params={"mode": "published"})
-
-    assert published.status_code == 200
-    assert published.json()["draft_business_prompt"] == "Texto publicado directo desde el editor."
-    assert published.json()["published_business_prompt"] == "Texto publicado directo desde el editor."
-    assert draft.json()["active_business_prompt"] == "Texto publicado directo desde el editor."
-    assert published_state.json()["active_business_prompt"] == "Texto publicado directo desde el editor."
-
-
-@pytest.mark.asyncio
-async def test_playground_prompt_config_migrates_legacy_default_prompt():
-    app = create_app(
-        Settings(
-            DATABASE_URL="sqlite+aiosqlite:///:memory:",
-            OPENAI_API_KEY="",
-            CRM_BACKEND="memory",
-            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
-        )
-    )
-    transport = ASGITransport(app=app)
-
-    async with app.router.lifespan_context(app):
-        async with app.state.sales_agent.session_factory() as session:
-            session.add(
-                PromptConfigRecord(
-                    prompt_key=PROMPT_KEY,
-                    draft_business_prompt=LEGACY_DEFAULT_BUSINESS_PROMPT,
-                    published_business_prompt=LEGACY_DEFAULT_BUSINESS_PROMPT,
-                )
-            )
-            await session.commit()
-
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-            config = await client.get("/playground/prompt-config")
-
-    assert config.status_code == 200
-    assert config.json()["draft_business_prompt"] == DEFAULT_BUSINESS_PROMPT
-    assert config.json()["published_business_prompt"] == DEFAULT_BUSINESS_PROMPT
+    assert context.status_code == 200
+    payload = context.json()
+    assert "planner_scaffold" in payload
+    assert "Knowledge Context" in payload["planner_scaffold"]
+    knowledge_names = [item["name"] for item in payload["knowledge_sections"]]
+    assert "wabog_company" in knowledge_names
+    assert "wabog_pricing" in knowledge_names
 
 
 @pytest.mark.asyncio
@@ -536,3 +469,61 @@ async def test_prepare_batched_run_sticker_only_skips_reply(monkeypatch):
     assert prepared.planning.intent == "non_text_ignored"
     assert prepared.planning.should_reply is False
     assert prepared.response_text == ""
+
+
+@pytest.mark.asyncio
+async def test_local_chat_persists_knowledge_lookup_in_run_logs():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    transport = ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        planner = app.state.sales_agent.workflow.planner
+
+        async def fake_select_knowledge_sections(text, contact, recent_messages):  # noqa: ANN001
+            from sales_agent.services.planner import KnowledgeSelectionOutput
+            return KnowledgeSelectionOutput(
+                section_names=["wabog_pricing"],
+                reason="The user asked for pricing information.",
+            )
+
+        async def fake_plan_with_llm(text, contact, recent_messages, semantic_memories, knowledge_sections):  # noqa: ANN001
+            from sales_agent.domain.models import PlanningResult
+            return PlanningResult(
+                intent="ask_pricing",
+                confidence=0.9,
+                response_text="El precio depende del volumen y del tipo de operación que tengan.",
+                actions=[],
+            )
+
+        planner._llm = object()  # noqa: SLF001
+        planner._select_knowledge_sections = fake_select_knowledge_sections  # type: ignore[method-assign]  # noqa: SLF001
+        planner._plan_with_llm = fake_plan_with_llm  # type: ignore[method-assign]  # noqa: SLF001
+
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/chat/local",
+                json={
+                    "text": "y eso cuanto vale",
+                    "phone_number": "3156832800",
+                    "conversation_id": "pricing-lookup-test",
+                },
+            )
+
+        async with app.state.sales_agent.session_factory() as session:
+            records = (await session.execute(select(AgentRunRecord))).scalars().all()
+
+    assert response.status_code == 200
+    assert len(records) == 1
+    assert records[0].knowledge_lookups_json == [
+        {
+            "section": "wabog_pricing",
+            "reason": "The user asked for pricing information.",
+        }
+    ]

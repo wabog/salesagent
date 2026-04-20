@@ -72,10 +72,7 @@ Variables útiles para producción:
 - `POST /internal/replay`
 - `POST /chat/local`
 - `GET /playground`
-- `GET /playground/prompt-config`
-- `PUT /playground/prompt-config`
-- `POST /playground/prompt-config/publish`
-- `POST /playground/prompt-config/reset-draft`
+- `GET /playground/agent-context`
 - `GET /healthz`
 
 ## Probar desde chat local
@@ -88,14 +85,13 @@ http://127.0.0.1:8000/playground
 
 Ese playground usa el endpoint `POST /chat/local` para hablar con el agente sin pasar por Kapso. Sirve para probar Notion, OpenAI y memoria conversacional local antes de conectar WhatsApp real.
 
-El playground también permite editar la capa comercial del prompt del agente:
+Los prompts y el knowledge del agente viven en archivos `.md` dentro del repo y se cargan desde código:
 
-- `core prompt`: fijo en código. Define restricciones, estructura y reglas operativas.
-- `business prompt`: editable desde el playground y persistido en la base de datos.
-- `draft`: versión de trabajo para probar desde el mismo playground.
-- `published`: versión que usa el runtime normal del agente.
+- `core prompt`: instrucciones base y reglas operativas del planner.
+- `business rules`: brief comercial, segmentación, calificación y CTA.
+- `knowledge`: secciones consultables por el agente bajo demanda, por ejemplo compañía, pricing, FAQ o integraciones.
 
-El selector `Prompt mode` del playground permite conversar contra `published` o `draft` sin tener que redeployar. WhatsApp y el flujo normal del backend siguen usando siempre `published`.
+El playground ya no permite editar prompts. Solo muestra en lectura el scaffold del planner y las secciones de knowledge cargadas desde archivos versionados.
 
 En `production` el playground queda deshabilitado por defecto. Si lo habilitas con `PLAYGROUND_ENABLED=true` y defines `PLAYGROUND_TOKEN`, accede con:
 

@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from sales_agent.adapters.whatsapp import KapsoPayloadError, normalize_kapso_payload
-from sales_agent.domain.models import InboundMessage, PromptMode
+from sales_agent.domain.models import InboundMessage
 
 
 router = APIRouter()
@@ -24,11 +24,6 @@ class ChatPayload(BaseModel):
     phone_number: str = "3156832405"
     conversation_id: str = "playground-conv"
     contact_name: str | None = None
-    prompt_mode: PromptMode = PromptMode.PUBLISHED
-
-
-class PromptConfigPayload(BaseModel):
-    business_prompt: str
 
 
 def _require_playground_access(request: Request, provided_token: str | None = None) -> None:
@@ -262,35 +257,15 @@ async def playground(request: Request, token: str | None = None) -> str:
           </div>
         </div>
         <div class="prompt-editor">
-          <div class="grid">
-            <div>
-              <label for="promptMode">Prompt mode</label>
-              <select id="promptMode">
-                <option value="published">Published</option>
-                <option value="draft">Draft</option>
-              </select>
-            </div>
-          </div>
-          <div class="stack">
-            <div>
-              <label for="businessPrompt">Business prompt editable</label>
-              <textarea id="businessPrompt" placeholder="Define tono, propuesta de valor, preguntas de calificación y playbook comercial."></textarea>
-            </div>
-            <p class="hint">`Published` es lo que usa el runtime normal. `Draft` sirve para editar y probar desde este playground antes de publicar.</p>
-          </div>
-          <div class="toolbar">
-            <button class="secondary" id="savePrompt" type="button">Guardar draft</button>
-            <button class="primary" id="publishPrompt" type="button">Publicar draft</button>
-            <button class="secondary" id="resetPrompt" type="button">Reset draft</button>
-          </div>
+          <p class="hint">Los prompts y el knowledge del agente viven en archivos `.md` versionados en el repo. El playground solo los muestra en lectura para inspección.</p>
           <div class="status" id="promptStatus"></div>
           <details>
-            <summary>Core prompt fijo</summary>
+            <summary>Planner scaffold</summary>
             <pre id="corePrompt"></pre>
           </details>
           <details>
-            <summary>Published actual</summary>
-            <pre id="publishedPrompt"></pre>
+            <summary>Knowledge sections</summary>
+            <pre id="knowledgeSections"></pre>
           </details>
         </div>
         <div id="chat" class="chat"></div>
@@ -314,11 +289,9 @@ async def playground(request: Request, token: str | None = None) -> str:
       const phone = document.getElementById("phone");
       const conversation = document.getElementById("conversation");
       const status = document.getElementById("status");
-      const promptMode = document.getElementById("promptMode");
-      const businessPrompt = document.getElementById("businessPrompt");
       const promptStatus = document.getElementById("promptStatus");
       const corePrompt = document.getElementById("corePrompt");
-      const publishedPrompt = document.getElementById("publishedPrompt");
+      const knowledgeSections = document.getElementById("knowledgeSections");
       function currentChatKey() {
         const normalizedPhone = (phone.value || "3156832405").trim() || "3156832405";
         const normalizedConversation = (conversation.value || "playground-conv").trim() || "playground-conv";
@@ -384,55 +357,30 @@ async def playground(request: Request, token: str | None = None) -> str:
         chat.scrollTop = chat.scrollHeight;
       }
 
-      async function fetchPromptConfig(mode = promptMode.value || "published") {
-        const response = await fetch(`/playground/prompt-config?mode=${encodeURIComponent(mode)}`, {
+      async function fetchAgentContext() {
+        const response = await fetch(`/playground/agent-context`, {
           headers: {
             ...(playgroundToken ? { "X-Playground-Token": playgroundToken } : {})
           }
         });
         if (!response.ok) {
-          throw new Error("No se pudo cargar la configuración de prompts.");
+          throw new Error("No se pudo cargar el contexto del agente.");
         }
         return await response.json();
       }
 
-      async function loadPromptConfig(mode = promptMode.value || "published") {
-        promptStatus.textContent = "Cargando configuración...";
+      async function loadAgentContext() {
+        promptStatus.textContent = "Cargando contexto del agente...";
         try {
-          const data = await fetchPromptConfig(mode);
-          businessPrompt.value = data.draft_business_prompt || "";
-          corePrompt.textContent = data.core_prompt || "";
-          publishedPrompt.textContent = data.published_business_prompt || "";
-          promptStatus.textContent = data.published_at
-            ? `Draft listo. Publicado por última vez: ${new Date(data.published_at).toLocaleString()}`
-            : "Usando prompt comercial por defecto.";
+          const data = await fetchAgentContext();
+          corePrompt.textContent = data.planner_scaffold || "";
+          const renderedKnowledge = (data.knowledge_sections || []).map((item) => {
+            return `# ${item.title} (${item.name})\n\n${item.content || ""}`;
+          }).join("\\n\\n---\\n\\n");
+          knowledgeSections.textContent = renderedKnowledge;
+          promptStatus.textContent = "Contexto cargado desde archivos .md del repo.";
         } catch (error) {
-          promptStatus.textContent = error instanceof Error ? error.message : "Error al cargar prompts.";
-        }
-      }
-
-      async function updatePrompt(action, endpoint, method, body) {
-        promptStatus.textContent = action;
-        try {
-          const response = await fetch(endpoint, {
-            method,
-            headers: {
-              "Content-Type": "application/json",
-              ...(playgroundToken ? { "X-Playground-Token": playgroundToken } : {})
-            },
-            ...(body ? { body: JSON.stringify(body) } : {})
-          });
-          if (!response.ok) {
-            const error = await response.json().catch(() => ({}));
-            throw new Error(error.detail || "No se pudo actualizar el prompt.");
-          }
-          const data = await response.json();
-          businessPrompt.value = data.draft_business_prompt || "";
-          corePrompt.textContent = data.core_prompt || "";
-          publishedPrompt.textContent = data.published_business_prompt || "";
-          promptStatus.textContent = action === "Publicando draft..." ? "Draft publicado." : action === "Reseteando draft..." ? "Draft reseteado." : "Draft guardado.";
-        } catch (error) {
-          promptStatus.textContent = error instanceof Error ? error.message : "Error inesperado.";
+          promptStatus.textContent = error instanceof Error ? error.message : "Error al cargar contexto.";
         }
       }
 
@@ -462,8 +410,7 @@ async def playground(request: Request, token: str | None = None) -> str:
             body: JSON.stringify({
               text: value,
               phone_number: phone.value.trim() || "3156832405",
-              conversation_id: conversation.value.trim() || "playground-conv",
-              prompt_mode: promptMode.value || "published"
+              conversation_id: conversation.value.trim() || "playground-conv"
             })
           });
           const data = await response.json();
@@ -495,18 +442,6 @@ async def playground(request: Request, token: str | None = None) -> str:
       }
 
       document.getElementById("send").addEventListener("click", sendMessage);
-      document.getElementById("savePrompt").addEventListener("click", () =>
-        updatePrompt("Guardando draft...", "/playground/prompt-config", "PUT", { business_prompt: businessPrompt.value })
-      );
-      document.getElementById("publishPrompt").addEventListener("click", () =>
-        updatePrompt("Publicando draft...", "/playground/prompt-config/publish", "POST", { business_prompt: businessPrompt.value })
-      );
-      document.getElementById("resetPrompt").addEventListener("click", () =>
-        updatePrompt("Reseteando draft...", "/playground/prompt-config/reset-draft", "POST")
-      );
-      promptMode.addEventListener("change", () => {
-        loadPromptConfig(promptMode.value);
-      });
       text.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
@@ -525,52 +460,20 @@ async def playground(request: Request, token: str | None = None) -> str:
         });
       }
       render(loadState());
-      loadPromptConfig();
+      loadAgentContext();
     </script>
   </body>
 </html>
 """
 
 
-@router.get("/playground/prompt-config")
-async def get_prompt_config(
-    request: Request,
-    mode: PromptMode = PromptMode.PUBLISHED,
-    x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
-) -> dict:
-    _require_playground_access(request, x_playground_token)
-    return await request.app.state.sales_agent.get_prompt_editor_state(mode=mode)
-
-
-@router.put("/playground/prompt-config")
-async def save_prompt_config(
-    payload: PromptConfigPayload,
+@router.get("/playground/agent-context")
+async def get_agent_context(
     request: Request,
     x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
 ) -> dict:
     _require_playground_access(request, x_playground_token)
-    return await request.app.state.sales_agent.save_prompt_draft(payload.business_prompt)
-
-
-@router.post("/playground/prompt-config/publish")
-async def publish_prompt_config(
-    request: Request,
-    payload: PromptConfigPayload | None = None,
-    x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
-) -> dict:
-    _require_playground_access(request, x_playground_token)
-    if payload is not None:
-        await request.app.state.sales_agent.save_prompt_draft(payload.business_prompt)
-    return await request.app.state.sales_agent.publish_prompt_draft()
-
-
-@router.post("/playground/prompt-config/reset-draft")
-async def reset_prompt_config(
-    request: Request,
-    x_playground_token: str | None = Header(default=None, alias="X-Playground-Token"),
-) -> dict:
-    _require_playground_access(request, x_playground_token)
-    return await request.app.state.sales_agent.reset_prompt_draft()
+    return await request.app.state.sales_agent.get_playground_context()
 
 
 @router.post("/webhooks/whatsapp/kapso")
@@ -617,7 +520,6 @@ async def local_chat(
         raw_payload={"source": "playground"},
         provider="local-playground",
         contact_name=payload.contact_name,
-        prompt_mode=payload.prompt_mode,
     )
     result = await request.app.state.sales_agent.handle_event(event, wait_for_response=True)
     return result.model_dump(mode="json")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -23,7 +24,6 @@ from sales_agent.domain.models import (
     InboundProcessingResult,
     OutboundMessage,
     PlanningResult,
-    PromptMode,
     ToolExecutionResult,
 )
 from sales_agent.graph.workflow import SalesAgentWorkflow
@@ -39,7 +39,11 @@ from sales_agent.services.name_validation import (
 )
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
-from sales_agent.services.prompt_store import PromptConfigStore
+from sales_agent.services.prompt_library import PromptLibrary
+
+
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
 
 def _merge_unique_messages(*message_groups: list[ConversationMessage], limit: int) -> list[ConversationMessage]:
@@ -87,7 +91,7 @@ class SalesAgentApplication:
         self.engine = build_engine(settings.database_url)
         self.session_factory: async_sessionmaker[AsyncSession] = build_session_factory(self.engine)
         self.memory_store = SqlAlchemyMemoryStore(self.session_factory)
-        self.prompt_store = PromptConfigStore(self.session_factory)
+        self.prompt_library = PromptLibrary()
         self.name_validator = ContactNameValidator(settings)
         self.media_preprocessor = InboundMediaPreprocessor(settings)
         self._conversation_locks: dict[str, asyncio.Lock] = {}
@@ -99,7 +103,7 @@ class SalesAgentApplication:
             memory_store=self.memory_store,
             channel_adapter=self.channel_adapter,
             calendar_adapter=self.calendar_adapter,
-            planner=AgentPlanner(settings, prompt_store=self.prompt_store),
+            planner=AgentPlanner(settings, prompt_library=self.prompt_library),
             policy=ToolExecutionPolicy(),
         )
         self.inbound_processor = DebouncedInboundProcessor(
@@ -195,7 +199,6 @@ class SalesAgentApplication:
                 contact=contact,
                 recent_messages=[message.text for message in recent_messages],
                 semantic_memories=semantic_memories,
-                prompt_mode=anchor_event.prompt_mode,
             )
             response_text = planning.response_text.strip()
 
@@ -284,6 +287,12 @@ class SalesAgentApplication:
                     tool_results.append(ToolExecutionResult(action=action, success=False, error=str(exc)))
 
             prepared.response_text = self._finalize_response_text(prepared.response_text, tool_results, current_lead)
+            if planning.knowledge_lookups:
+                logger.info(
+                    "run_knowledge_lookup run_id=%s sections=%s",
+                    prepared.run_id,
+                    [lookup.section for lookup in planning.knowledge_lookups],
+                )
 
             if current_lead is not None:
                 await self.memory_store.remember_contact(current_lead)
@@ -294,6 +303,7 @@ class SalesAgentApplication:
                 intent=planning.intent,
                 response_text=prepared.response_text,
                 tool_results=tool_results,
+                knowledge_lookups=planning.knowledge_lookups,
             )
 
             if planning.should_reply and prepared.response_text:
@@ -400,24 +410,9 @@ class SalesAgentApplication:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def get_prompt_editor_state(self, mode: PromptMode = PromptMode.PUBLISHED) -> dict:
-        state = await self.prompt_store.get_editor_state(mode=mode)
-        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
-        return state
-
-    async def save_prompt_draft(self, business_prompt: str) -> dict:
-        state = await self.prompt_store.save_draft(business_prompt)
-        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
-        return state
-
-    async def publish_prompt_draft(self) -> dict:
-        state = await self.prompt_store.publish_draft()
-        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
-        return state
-
-    async def reset_prompt_draft(self) -> dict:
-        state = await self.prompt_store.reset_draft()
-        state["core_prompt"] = self.workflow.planner.get_prompt_scaffold()
+    async def get_playground_context(self) -> dict:
+        state = self.prompt_library.get_playground_context()
+        state["planner_scaffold"] = self.workflow.planner.get_prompt_scaffold()
         return state
 
     def _build_crm_adapter(self):

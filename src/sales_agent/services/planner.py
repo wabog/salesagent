@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime, timedelta
-from textwrap import dedent
 from zoneinfo import ZoneInfo
 
 from openai import OpenAIError
@@ -11,9 +11,13 @@ from pydantic import BaseModel, Field
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import ActionType
-from sales_agent.domain.models import CRMContact, PlanningResult, PromptMode, ProposedAction
+from sales_agent.domain.models import CRMContact, KnowledgeLookup, PlanningResult, ProposedAction
 from sales_agent.services.name_validation import contact_has_reliable_name, get_name_confirmation_candidate, is_specific_person_name
-from sales_agent.services.prompt_store import DEFAULT_BUSINESS_PROMPT
+from sales_agent.services.prompt_library import PromptLibrary, PromptSection
+
+
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
 
 class PlannerOutput(BaseModel):
@@ -22,6 +26,11 @@ class PlannerOutput(BaseModel):
     response_text: str
     should_reply: bool = True
     actions: list[ProposedAction] = Field(default_factory=list)
+
+
+class KnowledgeSelectionOutput(BaseModel):
+    section_names: list[str] = Field(default_factory=list)
+    reason: str = ""
 
 
 class AgentPlanner:
@@ -38,16 +47,22 @@ class AgentPlanner:
         "No califica": -1,
     }
 
-    def __init__(self, settings: Settings, prompt_store=None) -> None:
+    def __init__(self, settings: Settings, prompt_library: PromptLibrary | None = None) -> None:
         self._settings = settings
-        self._prompt_store = prompt_store
+        self._prompt_library = prompt_library or PromptLibrary()
         self._llm = None
+        self._knowledge_selector_llm = None
         if settings.openai_api_key:
-            self._llm = ChatOpenAI(
+            base_llm = ChatOpenAI(
                 api_key=settings.openai_api_key,
                 model=settings.openai_model,
                 temperature=0.2,
-            ).with_structured_output(PlannerOutput, method="function_calling")
+            )
+            self._llm = base_llm.with_structured_output(PlannerOutput, method="function_calling")
+            self._knowledge_selector_llm = base_llm.with_structured_output(
+                KnowledgeSelectionOutput,
+                method="function_calling",
+            )
 
     async def plan(
         self,
@@ -55,14 +70,33 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str],
         semantic_memories: list[str],
-        prompt_mode: PromptMode = PromptMode.PUBLISHED,
     ) -> PlanningResult:
         hard_rule_result = self._apply_hard_rules(text, contact)
         if hard_rule_result is not None:
             return hard_rule_result
         if self._llm is not None:
             try:
-                result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories, prompt_mode)
+                selection = await self._select_knowledge_sections(text, contact, recent_messages)
+                knowledge_sections = self._prompt_library.get_sections_by_name(selection.section_names)
+                if knowledge_sections:
+                    logger.info(
+                        "knowledge_lookup sections=%s reason=%s",
+                        [section.name for section in knowledge_sections],
+                        selection.reason.strip() or "unspecified",
+                    )
+                result = await self._plan_with_llm(text, contact, recent_messages, semantic_memories, knowledge_sections)
+                if knowledge_sections:
+                    result = result.model_copy(
+                        update={
+                            "knowledge_lookups": [
+                                KnowledgeLookup(
+                                    section=section.name,
+                                    reason=selection.reason.strip() or "Selected by planner before final response.",
+                                )
+                                for section in knowledge_sections
+                            ]
+                        }
+                    )
                 repaired = self._repair_actions(result, text, contact, recent_messages)
                 enforced = self._enforce_sales_policy(repaired, text, contact, recent_messages)
                 return self._apply_planning_guardrail(enforced, text, contact, recent_messages)
@@ -76,105 +110,107 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str],
         semantic_memories: list[str],
-        prompt_mode: PromptMode,
+        knowledge_sections: list[PromptSection] | None = None,
     ) -> PlanningResult:
-        business_prompt = DEFAULT_BUSINESS_PROMPT
-        if self._prompt_store is not None:
-            business_prompt = await self._prompt_store.get_business_prompt(prompt_mode)
         prompt = self._compose_llm_prompt(
-            business_prompt=business_prompt,
             contact_json=contact.model_dump_json(indent=2) if contact else "None",
             recent_messages=str(recent_messages),
             semantic_memories=str(semantic_memories),
+            knowledge_context=self._render_knowledge_context(knowledge_sections or []),
             text=text,
         )
         output = await self._llm.ainvoke(prompt)
         return PlanningResult(**output.model_dump())
 
     def get_prompt_scaffold(self) -> str:
-        return self._compose_llm_prompt(
-            business_prompt="{{BUSINESS_PROMPT}}",
-            contact_json="{{CONTACT}}",
-            recent_messages="{{RECENT_MESSAGES}}",
-            semantic_memories="{{SEMANTIC_MEMORIES}}",
-            text="{{USER_MESSAGE}}",
-        )
+        return self._prompt_library.render_prompt_scaffold()
 
     def _compose_llm_prompt(
         self,
         *,
-        business_prompt: str,
         contact_json: str,
         recent_messages: str,
         semantic_memories: str,
+        knowledge_context: str,
         text: str,
     ) -> str:
-        return dedent(
-            f"""
-            You are a senior inbound sales agent for Wabog.com.
-            Your job is to qualify interest, move the lead to the correct pipeline stage, capture commercial notes,
-            propose demos or trials when appropriate, and push the conversation toward the next concrete step.
+        parts = [
+            "# Core Agent",
+            self._prompt_library.read_section("core_agent"),
+            "",
+            "# Business Rules",
+            self._prompt_library.read_section("business_rules"),
+            "",
+            "# Knowledge Context",
+            knowledge_context or "No additional knowledge loaded for this turn.",
+            "",
+            "Contact:",
+            contact_json,
+            "",
+            "Recent messages:",
+            recent_messages,
+            "",
+            "Semantic memories:",
+            semantic_memories,
+            "",
+            "User message:",
+            text,
+        ]
+        return "\n".join(parts).strip()
 
-            Commercial brief:
-            {business_prompt}
+    async def _select_knowledge_sections(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+    ) -> KnowledgeSelectionOutput:
+        if self._knowledge_selector_llm is None:
+            sections = self._prompt_library.search_sections(" ".join([text, *recent_messages[-3:]]))
+            return KnowledgeSelectionOutput(
+                section_names=[section.name for section in sections],
+                reason="Keyword fallback matched the user message and recent context.",
+            )
 
-            The orchestrator has already resolved the current lead from the sender phone number.
-            You can only act on that current lead. Never assume access to other CRM records.
-            Decide the user intent, whether to reply, and which actions to take on the current lead.
+        available = "\n".join(
+            f"- {section.name}: {section.description} Tags: {', '.join(section.tags)}"
+            for section in self._prompt_library.get_knowledge_sections()
+        )
+        selector_prompt = "\n".join(
+            [
+                "You decide whether the agent needs extra Wabog knowledge before responding.",
+                "Select zero to three sections only when the user is asking for product facts, pricing, plans, integrations, implementation, FAQ, or other factual business information.",
+                "Do not select sections for generic qualification, greeting, or scheduling-only turns.",
+                "Return only section names from the available list.",
+                "",
+                "Available sections:",
+                available,
+                "",
+                "Current contact:",
+                contact.model_dump_json(indent=2) if contact else "None",
+                "",
+                "Recent messages:",
+                str(recent_messages[-4:]),
+                "",
+                "User message:",
+                text,
+            ]
+        )
+        output = await self._knowledge_selector_llm.ainvoke(selector_prompt)
+        return KnowledgeSelectionOutput(**output.model_dump())
 
-            Sales rules:
-            - If the user explicitly shares or corrects contact data for the current lead, use UPDATE_CONTACT_FIELDS.
-            - UPDATE_CONTACT_FIELDS can persist `full_name` and `email` for the current lead.
-            - Never claim that a meeting, demo, invite, or calendar booking is confirmed unless CREATE_MEETING succeeded.
-            - Interest in a demo does not mean the demo is scheduled yet.
-            - Move a lead to `Demo agendada` only when there is a concrete date and time or the contact already has an upcoming calendar event.
-            - If the lead wants a demo but there is no exact slot yet, keep pushing to the next step without pretending it is booked.
-            - Before creating a meeting, make sure you have the lead full name and email if those fields are missing.
-            - Treat placeholder names such as "user", "usuario", phone numbers, or unconfirmed provider names as missing names.
-            - If the current lead has a candidate name that still needs confirmation, ask to confirm it before using it as final.
-            - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
-            - Reuse recent conversation context aggressively. If the last user message only confirms something like "si, agenda", "martes a las 9", or "dale", combine it with prior turns before deciding actions.
-            - If a prior turn already gave the day or hour for a demo and the current turn confirms it, create the meeting immediately when contact data is sufficient.
-            - Do not ask again for data that the current lead already has in Contact.
-            - Distinguish identity questions from contact-source questions. "como me llamo", "cual es mi nombre", and "como me tienes guardado" ask about the lead name, not about how Wabog contacted them.
-            - For identity questions, answer from the current Contact. If the current lead has no reliable name yet, say that plainly and ask for it.
-            - Questions like "de donde sacaron mi numero", "como consiguieron mi contacto", or "como me llamaron" are about contact source, not the lead name.
-            - If the user confirms that the current follow-up or promised next step was already completed, use COMPLETE_FOLLOWUP.
-            - Use only these stage transitions when justified by the message:
-              Prospecto -> Primer contacto
-              Primer contacto -> Demo agendada
-              Demo agendada -> Demo realizada
-              Demo realizada -> Propuesta enviada
-              Propuesta enviada -> Negociación
-              Trial or active evaluation -> Prueba / Trial
-              Closed won -> Cliente
-              Disqualified -> No califica
-              Lost -> Perdido
-            - Add notes when the user reveals buying intent, objections, current process, or next-step commitments.
-            - APPEND_NOTE entries must be CRM-ready summaries in Spanish, written naturally for a future sales rep.
-            - Notes must capture durable facts and next steps, not copy-paste the user's message.
-            - Prefer 1 to 3 short sentences such as company context, current tool, pain points, urgency, and agreed next step.
-            - Create a follow-up when a concrete next step or reminder is needed.
-            - CREATE_FOLLOWUP summaries must be short operational reminders, not the raw user message.
-            - Use CREATE_MEETING only when the lead already confirmed a specific day and time for the demo or call.
-            - CREATE_MEETING must include `start_iso`, `duration_minutes`, `title`, and `description`.
-            - If there is a self-scheduling link available and the lead wants a demo but has not fixed a time, offer that link naturally.
-            - If the contact metadata already includes an upcoming calendar event, treat the demo as scheduled.
-            - Never invent CRM data you do not have.
-
-            Contact:
-            {contact_json}
-
-            Recent messages:
-            {recent_messages}
-
-            Semantic memories:
-            {semantic_memories}
-
-            User message:
-            {text}
-            """
-        ).strip()
+    def _render_knowledge_context(self, sections: list[PromptSection]) -> str:
+        if not sections:
+            return ""
+        rendered: list[str] = []
+        for section in sections:
+            rendered.extend(
+                [
+                    f"## {section.title}",
+                    self._prompt_library.read_section(section.name),
+                    "",
+                ]
+            )
+        return "\n".join(rendered).strip()
 
     def _apply_hard_rules(self, text: str, contact: CRMContact | None) -> PlanningResult | None:
         normalized = self._normalize_lookup_text(text)

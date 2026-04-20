@@ -244,7 +244,7 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
     crm = InMemoryCRMAdapter()
 
     class StubPlanner:
-        async def plan(self, text, contact, recent_messages, semantic_memories, prompt_mode=None):  # noqa: ANN001
+        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
             return PlanningResult(
                 intent="demo_confirmation",
                 confidence=0.8,
@@ -295,7 +295,7 @@ async def test_workflow_preserves_calendar_metadata_after_meeting_creation_and_c
     crm = InMemoryCRMAdapter()
 
     class StubPlanner:
-        async def plan(self, text, contact, recent_messages, semantic_memories, prompt_mode=None):  # noqa: ANN001
+        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
             return PlanningResult(
                 intent="demo_scheduled",
                 confidence=0.9,

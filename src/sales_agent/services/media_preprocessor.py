@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import InboundMessage
+from sales_agent.services.prompt_library import PromptLibrary
 
 
 DOCUMENT_UNSUPPORTED_REPLY = (
@@ -29,6 +30,7 @@ class InboundMediaPreprocessor:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        self._prompt_library = PromptLibrary()
 
     async def preprocess_event(self, event: InboundMessage) -> MediaPreprocessingResult:
         message_type = (event.message_type or "text").lower()
@@ -70,11 +72,7 @@ class InboundMediaPreprocessor:
         return event.text.strip()
 
     async def _describe_image(self, event: InboundMessage) -> str:
-        prompt = (
-            "Resume solo el contexto util para una conversacion comercial de WhatsApp. "
-            "No describas detalles visuales irrelevantes. Extrae si hay texto legible, herramientas, procesos, "
-            "dolores operativos o solicitudes claras del usuario. Responde en espanol neutro en 1 a 3 frases."
-        )
+        prompt = self._prompt_library.get_image_prompt()
         if self._client is not None and event.media_url:
             try:
                 image_bytes = await self._download_media(event.media_url)
