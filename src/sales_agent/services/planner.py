@@ -98,8 +98,7 @@ class AgentPlanner:
                         }
                     )
                 repaired = self._repair_actions(result, text, contact, recent_messages)
-                enforced = self._enforce_sales_policy(repaired, text, contact, recent_messages)
-                return self._apply_planning_guardrail(enforced, text, contact, recent_messages)
+                return self._apply_planning_guardrail(repaired, text, contact, recent_messages)
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
         return self._plan_with_rules(text, contact)
@@ -301,14 +300,9 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str],
     ) -> PlanningResult:
-        current_stage = contact.stage if contact and contact.stage else "Prospecto"
         repaired_actions: list[ProposedAction] = []
         for action in result.actions:
             args = dict(action.args)
-            if action.type == ActionType.UPDATE_STAGE and not args.get("stage"):
-                inferred = self._infer_stage_from_text(text, current_stage, recent_messages)
-                if inferred:
-                    args["stage"] = inferred
             if action.type == ActionType.UPDATE_CONTACT_FIELDS:
                 fields = args.get("fields")
                 normalized_fields = dict(fields) if isinstance(fields, dict) else {}
@@ -323,18 +317,6 @@ class AgentPlanner:
                     for key, value in normalized_fields.items()
                     if key in {"email", "full_name"} and str(value).strip()
                 }
-            if action.type == ActionType.APPEND_NOTE:
-                existing_note = str(args.get("note", "")).strip()
-                if not existing_note or self._should_rewrite_note(existing_note, text):
-                    generated_note = self._build_sales_note(text, recent_messages)
-                    if generated_note:
-                        args["note"] = generated_note
-            if action.type == ActionType.CREATE_FOLLOWUP:
-                existing_summary = str(args.get("summary", "")).strip()
-                if not existing_summary or self._should_rewrite_followup_summary(existing_summary, text):
-                    args["summary"] = self._build_followup_summary(text, recent_messages)
-                if not str(args.get("due_date", "")).strip():
-                    args["due_date"] = self._infer_followup_due_date(text, recent_messages)
             if action.type == ActionType.COMPLETE_FOLLOWUP:
                 existing_outcome = str(args.get("outcome", "")).strip()
                 if not existing_outcome:
@@ -348,109 +330,6 @@ class AgentPlanner:
             repaired_actions.append(action.model_copy(update={"args": args}))
         return result.model_copy(update={"actions": repaired_actions})
 
-    def _enforce_sales_policy(
-        self,
-        result: PlanningResult,
-        text: str,
-        contact: CRMContact | None,
-        recent_messages: list[str] | None = None,
-    ) -> PlanningResult:
-        lowered = text.lower()
-        current_stage = contact.stage if contact and contact.stage else "Prospecto"
-        actions = [action.model_copy(deep=True) for action in result.actions]
-        notes = {action.args.get("note", "").strip() for action in actions if action.type == ActionType.APPEND_NOTE}
-        has_followup = any(action.type == ActionType.CREATE_FOLLOWUP for action in actions)
-        has_followup_completion = any(action.type == ActionType.COMPLETE_FOLLOWUP for action in actions)
-        has_meeting_creation = any(action.type == ActionType.CREATE_MEETING for action in actions)
-        upcoming_event = self._get_upcoming_calendar_event(contact)
-        completion_detected = self._should_complete_followup(lowered, contact) or (
-            upcoming_event is not None and bool(contact and contact.followup_summary)
-        )
-        stage_index = next(
-            (index for index, action in enumerate(actions) if action.type == ActionType.UPDATE_STAGE),
-            None,
-        )
-        inferred_stage = self._infer_stage_from_text(text, current_stage, recent_messages or [])
-        if upcoming_event is not None:
-            inferred_stage = "Demo agendada"
-        if inferred_stage and self._should_update_stage(current_stage, inferred_stage):
-            stage_action = ProposedAction(
-                type=ActionType.UPDATE_STAGE,
-                reason="La política comercial infirió una transición de etapa por la intención del lead.",
-                args={"stage": inferred_stage},
-            )
-            if stage_index is None:
-                actions.append(stage_action)
-            else:
-                actions[stage_index] = stage_action
-
-        if self._should_add_sales_note(lowered, notes):
-            actions.append(
-                ProposedAction(
-                    type=ActionType.APPEND_NOTE,
-                    reason="La política comercial registra el interés o contexto revelado por el lead.",
-                    args={"note": self._build_sales_note(text, recent_messages or [])},
-                )
-            )
-
-        if upcoming_event is not None and not notes:
-            actions.append(
-                ProposedAction(
-                    type=ActionType.APPEND_NOTE,
-                    reason="El calendario ya muestra una demo futura para este lead.",
-                    args={"note": self._build_calendar_note(upcoming_event)},
-                )
-            )
-
-        if completion_detected and not has_followup_completion:
-            actions.append(
-                ProposedAction(
-                    type=ActionType.COMPLETE_FOLLOWUP,
-                    reason="La política comercial detectó que el siguiente paso vigente ya fue cumplido.",
-                    args={"outcome": self._build_followup_completion_outcome(text, upcoming_event=upcoming_event)},
-                )
-            )
-            has_followup_completion = True
-
-        meeting_payload = self._build_meeting_payload(text, contact, recent_messages or [])
-        missing_meeting_fields = self._missing_contact_fields_for_meeting(contact)
-        if (
-            meeting_payload
-            and not has_meeting_creation
-            and upcoming_event is None
-            and not missing_meeting_fields
-        ):
-            actions.append(
-                ProposedAction(
-                    type=ActionType.CREATE_MEETING,
-                    reason="El lead ya dio una fecha y hora concreta para la demo.",
-                    args=meeting_payload,
-                )
-            )
-            has_meeting_creation = True
-
-        if self._should_create_followup(lowered) and not has_followup and not completion_detected and not has_meeting_creation:
-            actions.append(
-                ProposedAction(
-                    type=ActionType.CREATE_FOLLOWUP,
-                    reason="La política comercial requiere dejar el siguiente paso explícito.",
-                    args={
-                        "summary": self._build_followup_summary(text, recent_messages or []),
-                        "due_date": self._infer_followup_due_date(text, recent_messages or []),
-                    },
-                )
-            )
-
-        response_text = result.response_text
-        if meeting_payload and missing_meeting_fields and upcoming_event is None:
-            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields, contact)
-        if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
-            response_text = self._append_self_schedule_link(response_text)
-        if upcoming_event is not None:
-            response_text = self._append_calendar_confirmation(response_text, upcoming_event)
-
-        return result.model_copy(update={"actions": actions, "response_text": response_text})
-
     def _apply_planning_guardrail(
         self,
         result: PlanningResult,
@@ -458,75 +337,39 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str] | None = None,
     ) -> PlanningResult:
-        actions = [
-            action.model_copy(deep=True)
-            for action in result.actions
-            if not (action.type == ActionType.UPDATE_STAGE and not action.args.get("stage"))
-        ]
+        actions: list[ProposedAction] = []
+        for action in result.actions:
+            if action.type == ActionType.UPDATE_STAGE and not action.args.get("stage"):
+                continue
+            if action.type == ActionType.APPEND_NOTE and not str(action.args.get("note", "")).strip():
+                continue
+            if action.type == ActionType.CREATE_FOLLOWUP and not str(action.args.get("summary", "")).strip():
+                continue
+            actions.append(action.model_copy(deep=True))
         recent_messages = recent_messages or []
         projected_contact = self._project_contact_for_actions(contact, actions, text)
         meeting_payload = self._build_meeting_payload(text, projected_contact, recent_messages)
         missing_meeting_fields = self._missing_contact_fields_for_meeting(projected_contact)
         upcoming_event = self._get_upcoming_calendar_event(contact)
 
-        if meeting_payload and upcoming_event is None:
-            actions = [
-                action
-                for action in actions
-                if action.type not in {ActionType.COMPLETE_FOLLOWUP, ActionType.CREATE_FOLLOWUP}
-            ]
-
-            stage_updated = False
-            meeting_present = False
-            normalized_actions: list[ProposedAction] = []
-            for action in actions:
-                if action.type == ActionType.UPDATE_STAGE:
-                    stage_updated = True
-                    normalized_actions.append(
-                        action.model_copy(
-                            update={
-                                "reason": "El guardrail detectó que ya existe contexto suficiente para tratar la demo como agendada.",
-                                "args": {"stage": "Demo agendada"} if not missing_meeting_fields else {"stage": "Primer contacto"},
-                            }
-                        )
-                    )
-                    continue
-                if action.type == ActionType.CREATE_MEETING:
-                    meeting_present = True
-                    normalized_actions.append(
-                        action.model_copy(
-                            update={
-                                "reason": "El guardrail reconstruyó el slot de agenda usando el contexto reciente.",
-                                "args": meeting_payload,
-                            }
-                        )
-                    )
-                    continue
-                normalized_actions.append(action)
-
-            if not stage_updated:
-                normalized_actions.append(
-                    ProposedAction(
-                        type=ActionType.UPDATE_STAGE,
-                        reason="El guardrail fija la etapa comercial según el contexto actual de agenda.",
-                        args={"stage": "Demo agendada"} if not missing_meeting_fields else {"stage": "Primer contacto"},
-                    )
-                )
-            if not missing_meeting_fields and not meeting_present:
-                normalized_actions.append(
-                    ProposedAction(
-                        type=ActionType.CREATE_MEETING,
-                        reason="El guardrail detectó fecha y hora concretas para crear la demo sin esperar otra confirmación.",
-                        args=meeting_payload,
-                    )
-                )
-            actions = normalized_actions
-
         response_text = result.response_text
-        if meeting_payload and not missing_meeting_fields and upcoming_event is None:
-            response_text = "Perfecto. Voy a agendar la demo ahora mismo."
-        elif meeting_payload and missing_meeting_fields and upcoming_event is None:
-            response_text = self._build_missing_meeting_fields_response(missing_meeting_fields, projected_contact)
+        normalized_actions: list[ProposedAction] = []
+        for action in actions:
+            if action.type != ActionType.CREATE_MEETING:
+                normalized_actions.append(action)
+                continue
+
+            merged_args = dict(action.args)
+            if meeting_payload is not None:
+                merged_args = dict(meeting_payload) | {key: value for key, value in merged_args.items() if value}
+
+            if missing_meeting_fields:
+                response_text = self._build_missing_meeting_fields_response(missing_meeting_fields, projected_contact)
+                continue
+
+            normalized_actions.append(action.model_copy(update={"args": merged_args}))
+
+        actions = normalized_actions
 
         if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
@@ -975,7 +818,6 @@ class AgentPlanner:
         response_lines: list[str] = []
         intent = "generic_reply"
         confidence = 0.55
-        current_stage = contact.stage if contact and contact.stage else "Prospecto"
         upcoming_event = self._get_upcoming_calendar_event(contact)
 
         def add_stage_change(stage: str, reason: str) -> None:
@@ -1075,103 +917,12 @@ class AgentPlanner:
             confidence = 0.95
             response_lines.append("Voy a escalar esta conversación al equipo comercial.")
 
-        if any(token in lowered for token in ("precio", "planes", "cotización", "cotizacion", "cuanto cuesta", "costos")):
-            if intent == "generic_reply":
-                intent = "pricing_interest"
-                confidence = 0.8
-            if current_stage == "Prospecto":
-                add_stage_change("Primer contacto", "El lead preguntó por precio o planes.")
-            actions.append(
-                ProposedAction(
-                    type=ActionType.APPEND_NOTE,
-                    reason="El lead preguntó por precio o planes.",
-                    args={"note": self._build_sales_note(text, [])},
-                )
-            )
-            response_lines.append(
-                "Claro. Wabog está pensado para abogados y despachos que quieren operar mejor sus procesos. "
-                "Para orientarte bien, te ayudo a revisar tu caso y te propongo el siguiente paso comercial."
-            )
-
-        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-            if intent == "generic_reply":
-                intent = "demo_interest"
-                confidence = 0.85
-            meeting_payload = self._build_meeting_payload(text, contact, [])
-            missing_meeting_fields = self._missing_contact_fields_for_meeting(contact)
-            target_stage = "Demo agendada" if meeting_payload and not missing_meeting_fields else "Primer contacto"
-            add_stage_change(target_stage, "El lead pidió demo o reunión comercial.")
-            actions.append(
-                ProposedAction(
-                    type=ActionType.APPEND_NOTE,
-                    reason="El lead pidió demo o reunión.",
-                    args={"note": self._build_sales_note(text, [])},
-                )
-            )
-            if meeting_payload and upcoming_event is None and not missing_meeting_fields:
-                actions.append(
-                    ProposedAction(
-                        type=ActionType.CREATE_MEETING,
-                        reason="El lead ya definió una fecha y hora concreta para la demo.",
-                        args=meeting_payload,
-                    )
-                )
-                response_lines.append("Perfecto. Voy a dejar esa demo creada de una vez en el calendario.")
-            elif meeting_payload and missing_meeting_fields:
-                response_lines.append(self._build_missing_meeting_fields_response(missing_meeting_fields, contact))
-            elif upcoming_event is None:
-                actions.append(
-                    ProposedAction(
-                        type=ActionType.CREATE_FOLLOWUP,
-                        reason="Hay que dar siguiente paso comercial después de pedir demo.",
-                        args={
-                            "summary": self._build_followup_summary(text, []),
-                            "due_date": self._infer_followup_due_date(text, []),
-                        },
-                    )
-                )
-                response_lines.append(
-                    "Perfecto. Tiene sentido coordinar una demo para mostrarte cómo Wabog puede ayudarte a gestionar y vender mejor tus servicios legales."
-                )
-
-        if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
-            if intent == "generic_reply":
-                intent = "trial_interest"
-                confidence = 0.86
-            add_stage_change("Prueba / Trial", "El lead quiere probar la solución.")
-            actions.append(
-                ProposedAction(
-                    type=ActionType.APPEND_NOTE,
-                    reason="El lead expresó interés en trial.",
-                    args={"note": self._build_sales_note(text, [])},
-                )
-            )
-            response_lines.append(
-                "Buen siguiente paso. Si estás evaluando Wabog, te acompaño para que la prueba tenga un objetivo comercial claro y veas rápido si encaja contigo."
-            )
-
-        if any(token in lowered for token in ("no me interesa", "no estoy interesado", "no aplica", "no aplica para mi")):
-            if intent == "generic_reply":
-                intent = "disqualified"
-                confidence = 0.88
-            add_stage_change("No califica", "El lead indicó que no aplica o no tiene interés.")
-            response_lines.append("Entendido. Dejo registrado que por ahora no hay encaje comercial.")
-
-        if any(token in lowered for token in ("ya compré", "ya compre", "vamos a trabajar", "arranquemos", "listo hagámosle", "listo hagamosle")):
-            if intent == "generic_reply":
-                intent = "closed_won"
-                confidence = 0.9
-            add_stage_change("Cliente", "El lead indicó cierre o arranque.")
-            response_lines.append("Perfecto. Dejo el lead como cliente y registramos el siguiente paso operativo.")
-
         if not response_lines:
             response_lines.append(
                 "Perfecto. Soy el agente comercial de Wabog para abogados. Cuéntame cómo estás manejando hoy tus procesos o qué quieres mejorar, y te guío al siguiente paso."
             )
 
         response_text = " ".join(response_lines)
-        if self._should_offer_self_schedule_link(lowered, upcoming_event) and self._settings.google_calendar_self_schedule_url:
-            response_text = self._append_self_schedule_link(response_text)
         if upcoming_event is not None:
             response_text = self._append_calendar_confirmation(response_text, upcoming_event)
 
