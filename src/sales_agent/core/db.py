@@ -76,6 +76,24 @@ def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessio
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _run_legacy_sqlite_migrations(conn)
+
+
+async def _run_legacy_sqlite_migrations(conn) -> None:
+    if conn.dialect.name != "sqlite":
+        return
+
+    columns = {
+        row[1]
+        for row in (
+            await conn.exec_driver_sql("PRAGMA table_info(agent_runs)")
+        ).fetchall()
+    }
+    if "knowledge_lookups_json" not in columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE agent_runs "
+            "ADD COLUMN knowledge_lookups_json JSON NOT NULL DEFAULT '[]'"
+        )
 
 
 async def message_exists(session: AsyncSession, message_id: str) -> bool:
