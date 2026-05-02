@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -9,6 +10,7 @@ from sales_agent.domain.models import InboundMessage, InboundProcessingResult
 
 PrepareBatch = Callable[[list[InboundMessage]], Awaitable[object]]
 CommitBatch = Callable[[object], Awaitable[InboundProcessingResult]]
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -128,6 +130,7 @@ class DebouncedInboundProcessor:
                     payload = payload.model_copy(update={"response_text": "", "tool_results": []})
                 future.set_result(payload)
         except Exception as exc:  # noqa: BLE001
+            logger.exception("debounced inbound batch failed for conversation_id=%s", conversation_id)
             for _, future in waiters_snapshot:
                 if not future.done():
                     future.set_exception(exc)

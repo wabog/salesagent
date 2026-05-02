@@ -76,24 +76,46 @@ def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessio
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await _run_legacy_sqlite_migrations(conn)
+        await _run_additive_migrations(conn)
 
 
-async def _run_legacy_sqlite_migrations(conn) -> None:
-    if conn.dialect.name != "sqlite":
+async def _run_additive_migrations(conn) -> None:
+    columns = await _get_table_columns(conn, "agent_runs")
+    if "knowledge_lookups_json" in columns:
         return
 
-    columns = {
-        row[1]
-        for row in (
-            await conn.exec_driver_sql("PRAGMA table_info(agent_runs)")
-        ).fetchall()
-    }
-    if "knowledge_lookups_json" not in columns:
+    if conn.dialect.name == "postgresql":
         await conn.exec_driver_sql(
             "ALTER TABLE agent_runs "
-            "ADD COLUMN knowledge_lookups_json JSON NOT NULL DEFAULT '[]'"
+            "ADD COLUMN IF NOT EXISTS knowledge_lookups_json JSON NOT NULL DEFAULT '[]'"
         )
+        return
+
+    await conn.exec_driver_sql(
+        "ALTER TABLE agent_runs "
+        "ADD COLUMN knowledge_lookups_json JSON NOT NULL DEFAULT '[]'"
+    )
+
+
+async def _get_table_columns(conn, table_name: str) -> set[str]:
+    if conn.dialect.name == "sqlite":
+        return {
+            row[1]
+            for row in (
+                await conn.exec_driver_sql(f"PRAGMA table_info({table_name})")
+            ).fetchall()
+        }
+
+    if conn.dialect.name == "postgresql":
+        result = await conn.exec_driver_sql(
+            "SELECT column_name "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = :table_name",
+            {"table_name": table_name},
+        )
+        return {row[0] for row in result.fetchall()}
+
+    return set()
 
 
 async def message_exists(session: AsyncSession, message_id: str) -> bool:
