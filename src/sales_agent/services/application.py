@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -278,6 +279,7 @@ class SalesAgentApplication:
                             description=action.args["description"],
                         )
                         current_lead = scoped_tools.current_lead
+                        current_lead = await self._sync_crm_after_meeting_created(scoped_tools, current_lead, payload)
                     elif action.type == ActionType.HANDOFF_HUMAN:
                         payload = {"status": "requested"}
                     else:
@@ -440,7 +442,7 @@ class SalesAgentApplication:
         tool_results: list[ToolExecutionResult],
         contact: CRMContact | None,
     ) -> str:
-        final_text = response_text.strip()
+        final_text = response_text.strip().replace("https://wabog.com/signup", "https://wabog.com")
         failed_meeting = next(
             (
                 result
@@ -491,3 +493,33 @@ class SalesAgentApplication:
         if upcoming_event and not final_text:
             return f"Veo una demo futura agendada para {upcoming_event.get('start_iso')}."
         return final_text
+
+    async def _sync_crm_after_meeting_created(
+        self,
+        scoped_tools: LeadScopedCRMTools,
+        current_lead: CRMContact | None,
+        meeting_payload: dict,
+    ) -> CRMContact | None:
+        if current_lead is None:
+            return None
+
+        start_iso = str(meeting_payload.get("start_iso", "")).strip()
+        due_date = datetime.fromisoformat(start_iso).date().isoformat() if start_iso else None
+
+        if current_lead.stage != "Demo agendada":
+            current_lead = await scoped_tools.update_stage("Demo agendada")
+
+        note_parts = [f"Demo agendada para {start_iso}." if start_iso else "Demo agendada."]
+        if meeting_payload.get("meet_link"):
+            note_parts.append(f"Meet: {meeting_payload['meet_link']}.")
+        elif meeting_payload.get("html_link"):
+            note_parts.append(f"Evento: {meeting_payload['html_link']}.")
+        current_lead = await scoped_tools.add_note(" ".join(note_parts))
+
+        summary = (
+            f"Asistir a la demo agendada para {start_iso} y continuar seguimiento comercial."
+            if start_iso
+            else "Asistir a la demo agendada y continuar seguimiento comercial."
+        )
+        await scoped_tools.create_followup(summary, due_date=due_date)
+        return scoped_tools.current_lead

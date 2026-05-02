@@ -258,6 +258,57 @@ def test_planning_guardrail_does_not_create_meeting_from_recent_context_when_llm
     action_types = [action.type for action in guarded.actions]
     assert ActionType.CREATE_MEETING not in action_types
     assert ActionType.COMPLETE_FOLLOWUP in action_types
+
+
+def test_planning_guardrail_synthesizes_trial_stage_when_llm_omits_it():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Demo",
+        email=None,
+        stage=None,
+    )
+    result = PlanningResult(
+        intent="user wants to try Wabog",
+        confidence=0.72,
+        response_text="Cuéntame un poco más y te paso el link.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "quiero probarlo",
+        contact,
+        ["manejamos 5 procesos al mes", "cuanto cuesta"],
+    )
+
+    stage_action = next(action for action in guarded.actions if action.type == ActionType.UPDATE_STAGE)
+    assert stage_action.args["stage"] == "Prueba / Trial"
+
+
+def test_planning_guardrail_normalizes_trial_response_to_public_wabog_link():
+    planner = build_planner()
+    result = PlanningResult(
+        intent="user wants to try Wabog",
+        confidence=0.78,
+        response_text=(
+            "Para probar Wabog, puedes iniciar una prueba gratuita directamente en nuestra plataforma: "
+            "https://wabog.com/signup"
+        ),
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "como lo pruebo",
+        None,
+        ["manejo 5 procesos al mes"],
+    )
+
+    assert "https://wabog.com" in guarded.response_text
+    assert "https://app.wabog.com" in guarded.response_text
+    assert "https://wabog.com/signup" not in guarded.response_text
     assert "procederé a enviar la invitación" not in guarded.response_text.lower()
 
 
@@ -279,6 +330,39 @@ def test_planning_guardrail_removes_false_booking_claim_without_meeting_action()
 
     assert "procederé a enviar la invitación" not in guarded.response_text.lower()
     assert "correctamente agendada" in guarded.response_text.lower()
+
+
+def test_planning_guardrail_synthesizes_meeting_when_slot_is_concrete_and_contact_is_complete():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Laura Gomez",
+        email="laura@example.com",
+        stage="Primer contacto",
+    )
+    result = PlanningResult(
+        intent="schedule_demo",
+        confidence=0.9,
+        response_text="Perfecto, Laura. Procederé a crear la invitación para la demo.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "mañana a las 3 pm me sirve",
+        contact,
+        [
+            "si me interesa ver una demo",
+            "mi nombre es Laura Gomez",
+            "mi correo es laura@example.com",
+        ],
+    )
+
+    meeting_actions = [action for action in guarded.actions if action.type == ActionType.CREATE_MEETING]
+    assert len(meeting_actions) == 1
+    assert meeting_actions[0].args["title"] == "Demo Wabog - Laura Gomez"
+    assert "T15:00:00" in meeting_actions[0].args["start_iso"]
 
 
 def test_planning_guardrail_drops_empty_append_note_and_followup_actions():
@@ -449,31 +533,6 @@ async def test_hard_rule_distinguishes_contact_source_questions():
     assert result.intent == "ask_contact_source"
     assert result.actions == []
     assert "te contactamos" in result.response_text.lower()
-
-
-@pytest.mark.asyncio
-async def test_hard_rule_returns_real_demo_link_when_upcoming_event_exists():
-    planner = build_planner()
-    contact = CRMContact(
-        external_id="lead-1",
-        phone_number="3150000000",
-        full_name="Carlos Ruiz",
-        metadata={
-            "calendar": {
-                "upcoming_event": {
-                    "id": "evt-1",
-                    "start_iso": "2026-04-21T18:00:00-05:00",
-                    "meet_link": "https://meet.google.com/abc-defg-hij",
-                }
-            }
-        },
-    )
-
-    result = await planner.plan("mandame el link por aqui", contact, [], [])
-
-    assert result.intent == "request_demo_link"
-    assert result.actions == []
-    assert "https://meet.google.com/abc-defg-hij" in result.response_text
 
 
 def test_append_calendar_confirmation_removes_unsupported_reminder_promise():

@@ -213,41 +213,6 @@ class AgentPlanner:
 
     def _apply_hard_rules(self, text: str, contact: CRMContact | None) -> PlanningResult | None:
         normalized = self._normalize_lookup_text(text)
-        upcoming_event = self._get_upcoming_calendar_event(contact)
-        if self._is_demo_link_request(normalized):
-            if upcoming_event:
-                link = upcoming_event.get("meet_link") or upcoming_event.get("html_link")
-                if link:
-                    return PlanningResult(
-                        intent="request_demo_link",
-                        confidence=0.99,
-                        response_text=f"Aquí tienes el link de la demo: {link}",
-                        actions=[],
-                        should_reply=True,
-                    )
-                start_iso = upcoming_event.get("start_iso")
-                if start_iso:
-                    return PlanningResult(
-                        intent="request_demo_link",
-                        confidence=0.96,
-                        response_text=(
-                            f"Veo la demo agendada para {start_iso}, pero no tengo un link disponible para compartirte por aquí todavía."
-                        ),
-                        actions=[],
-                        should_reply=True,
-                    )
-            if contact and self._settings.google_calendar_self_schedule_url:
-                return PlanningResult(
-                    intent="request_demo_link",
-                    confidence=0.9,
-                    response_text=(
-                        "Todavía no veo una demo agendada con link para compartirte. "
-                        f"Si quieres, puedes agendarla aquí: {self._settings.google_calendar_self_schedule_url}"
-                    ),
-                    actions=[],
-                    should_reply=True,
-                )
-
         if normalized in {
             "como me llamo",
             "cual es mi nombre",
@@ -371,10 +336,73 @@ class AgentPlanner:
 
         actions = normalized_actions
 
+        if (
+            meeting_payload is not None
+            and not missing_meeting_fields
+            and upcoming_event is None
+            and not any(action.type == ActionType.CREATE_MEETING for action in actions)
+            and not actions
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.CREATE_MEETING,
+                    reason="El lead confirmó un horario concreto para la demo y ya tiene datos completos.",
+                    args=dict(meeting_payload),
+                )
+            )
+
         if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
 
+        inferred_stage = self._infer_stage_from_text(
+            text,
+            contact.stage if contact and contact.stage else "Prospecto",
+            recent_messages,
+        )
+        negative_stage_signal = any(
+            phrase in text.lower()
+            for phrase in (
+                "no quiero",
+                "no me interesa",
+                "no aplica",
+                "no gracias",
+                "despues",
+                "después",
+            )
+        )
+        if (
+            inferred_stage
+            and self._should_update_stage(contact.stage if contact and contact.stage else "Prospecto", inferred_stage)
+            and not negative_stage_signal
+            and not any(action.type == ActionType.UPDATE_STAGE for action in actions)
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.UPDATE_STAGE,
+                    reason="Se infiere una etapa comercial válida a partir del mensaje actual y el contexto reciente.",
+                    args={"stage": inferred_stage},
+                )
+            )
+
+        response_text = self._normalize_trial_response(text, response_text)
+
         return result.model_copy(update={"actions": actions, "response_text": response_text})
+
+    def _normalize_trial_response(self, text: str, response_text: str) -> str:
+        lowered = text.lower()
+        if not any(token in lowered for token in ("prueba", "pruebo", "probar", "probarlo", "testear")):
+            return self._normalize_wabog_urls(response_text)
+        normalized = self._normalize_wabog_urls(response_text)
+        wabog_url = "https://wabog.com"
+        app_url = "https://app.wabog.com"
+        return (
+            f"Puedes probar Wabog desde {wabog_url}. "
+            f"Funciona muy bien a través de WhatsApp para monitoreo y seguimiento. "
+            f"Si prefieres una app más profesional para gestión de procesos, también tenemos {app_url}."
+        )
+
+    def _normalize_wabog_urls(self, response_text: str) -> str:
+        return re.sub(r"https://wabog\.com/[^\s)\]]+", "https://wabog.com", response_text)
 
     def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
         lowered = text.lower()
@@ -1031,16 +1059,18 @@ class AgentPlanner:
 
     def _extract_requested_meeting_start(self, text: str, recent_messages: list[str] | None = None) -> datetime | None:
         context_messages = [message.strip() for message in (recent_messages or [])[-6:] if message.strip()]
-        combined_text = " ".join(context_messages + [text.strip()]).strip()
-        lowered = combined_text.lower()
-        if not any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
+        current_text = text.strip()
+        lowered_text = current_text.lower()
+        lowered_context_messages = [message.lower() for message in context_messages]
+        combined_lowered = " ".join(lowered_context_messages + [lowered_text]).strip()
+        if not any(token in combined_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
             return None
         tz = ZoneInfo(self._settings.google_calendar_timezone)
         base_date = datetime.now(tz).date()
 
         relative_match = re.search(
             r"\b(hoy|mañana|manana)\b(?:.*?)(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-            lowered,
+            lowered_text,
         )
         if relative_match:
             day_token, hour_raw, minute_raw, meridiem = relative_match.groups()
@@ -1055,7 +1085,7 @@ class AgentPlanner:
                 hour += 12
             return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
 
-        isoish_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})[ t](\d{1,2}):(\d{2})\b", lowered)
+        isoish_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})[ t](\d{1,2}):(\d{2})\b", lowered_text)
         if isoish_match:
             date_raw, hour_raw, minute_raw = isoish_match.groups()
             target_date = date.fromisoformat(date_raw)
@@ -1072,10 +1102,16 @@ class AgentPlanner:
             "sábado": 5,
             "domingo": 6,
         }
-        weekday_match = re.search(r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", lowered)
-        hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lowered)
-        if weekday_match and hour_match:
-            weekday_name = weekday_match.group(1)
+        current_weekday_match = re.search(r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", lowered_text)
+        context_weekday_name = None
+        for message in reversed(lowered_context_messages):
+            if match := re.search(r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", message):
+                context_weekday_name = match.group(1)
+                break
+
+        weekday_name = current_weekday_match.group(1) if current_weekday_match else context_weekday_name
+        hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lowered_text)
+        if weekday_name and hour_match:
             weekday = weekday_map[weekday_name]
             days_ahead = (weekday - base_date.weekday()) % 7
             if days_ahead == 0:
@@ -1090,9 +1126,8 @@ class AgentPlanner:
                 hour = 0
             return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
 
-        bare_hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\b", lowered)
-        if weekday_match and bare_hour_match:
-            weekday_name = weekday_match.group(1)
+        bare_hour_match = re.search(r"(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\b", lowered_text)
+        if weekday_name and bare_hour_match:
             weekday = weekday_map[weekday_name]
             days_ahead = (weekday - base_date.weekday()) % 7
             if days_ahead == 0:
@@ -1101,34 +1136,12 @@ class AgentPlanner:
             hour_raw, minute_raw = bare_hour_match.groups()
             hour = int(hour_raw)
             minute = int(minute_raw or "0")
-            if any(token in lowered for token in ("tarde", "pm", "noche")) and 1 <= hour <= 11:
+            period_context = " ".join(lowered_context_messages[-2:] + [lowered_text]).strip()
+            if any(token in period_context for token in ("tarde", "pm", "noche")) and 1 <= hour <= 11:
                 hour += 12
-            elif "mañana" in lowered and hour == 12:
+            elif "mañana" in period_context and hour == 12:
                 hour = 0
-            elif hour == 12 and "mediodia" not in lowered and "medio dia" not in lowered and "tarde" not in lowered:
+            elif hour == 12 and "mediodia" not in period_context and "medio dia" not in period_context and "tarde" not in period_context:
                 hour = 12
             return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
         return None
-
-    def _is_demo_link_request(self, normalized_text: str) -> bool:
-        return any(
-            phrase in normalized_text
-            for phrase in (
-                "mandame el link",
-                "mandame el enlace",
-                "pasame el link",
-                "pasame el enlace",
-                "enviame el link",
-                "enviame el enlace",
-                "me mandas el link",
-                "me mandas el enlace",
-                "dame el link",
-                "dame el enlace",
-                "link de la demo",
-                "enlace de la demo",
-                "link del meet",
-                "enlace del meet",
-                "no me mandaste nada",
-                "no la veo",
-            )
-        )

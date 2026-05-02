@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from sales_agent.domain.models import CRMContact
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def merge_contact_with_shadow(contact: CRMContact, shadow: CRMContact | None) -> CRMContact:
@@ -35,9 +39,22 @@ async def enrich_contact_with_calendar(contact: CRMContact, calendar_adapter, se
         metadata["calendar"] = calendar_state
         return contact.model_copy(update={"metadata": metadata})
 
-    upcoming_event = await calendar_adapter.find_upcoming_meeting(contact)
+    try:
+        upcoming_event = await calendar_adapter.find_upcoming_meeting(contact)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "calendar_lookup_failed contact_id=%s error=%s",
+            contact.external_id,
+            exc,
+        )
+        calendar_state["available"] = False
+        calendar_state["error"] = str(exc)
+        metadata["calendar"] = calendar_state
+        return contact.model_copy(update={"metadata": metadata})
+
     previous_event_id = ((previous_calendar.get("upcoming_event") or {}).get("id"))
     current_event_id = (upcoming_event or {}).get("id")
+    calendar_state["available"] = True
     calendar_state["upcoming_event"] = upcoming_event
     calendar_state["just_booked"] = bool(current_event_id and current_event_id != previous_event_id)
     metadata["calendar"] = calendar_state
