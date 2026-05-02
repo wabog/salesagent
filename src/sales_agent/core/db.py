@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, String, Text, select
+from sqlalchemy import JSON, DateTime, String, Text, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -107,10 +107,12 @@ async def _get_table_columns(conn, table_name: str) -> set[str]:
         }
 
     if conn.dialect.name == "postgresql":
-        result = await conn.exec_driver_sql(
-            "SELECT column_name "
-            "FROM information_schema.columns "
-            "WHERE table_schema = 'public' AND table_name = :table_name",
+        result = await conn.execute(
+            text(
+                "SELECT column_name "
+                "FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = :table_name"
+            ),
             {"table_name": table_name},
         )
         return {row[0] for row in result.fetchall()}
