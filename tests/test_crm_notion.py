@@ -121,3 +121,4 @@ def test_to_contact_reads_notes_as_timeline_lines():
         "2026-04-15 - Seguimiento creado: Enviar propuesta.",
         "2026-04-16 - Seguimiento completado: Enviar propuesta.",
     ]
+    assert contact.metadata == {}

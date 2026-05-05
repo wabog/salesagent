@@ -32,6 +32,35 @@ def test_plan_with_rules_does_not_make_commercial_decisions_from_keywords():
     assert result.intent == "generic_reply"
 
 
+def test_serialize_contact_for_prompt_uses_curated_crm_context():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero Villegas",
+        email="fabian@example.com",
+        stage="Primer contacto",
+        followup_summary="Coordinar fecha y hora para demo comercial.",
+        followup_due_date=date(2026, 5, 5),
+        notes=[
+            "2026-05-01 - Lead confirmó volumen alto.",
+            "2026-05-02 - Usa Excel para seguimiento.",
+        ],
+        metadata={
+            "raw_properties": {"Nombre": "ruido"},
+            "name_validation": {"status": "trusted"},
+            "calendar": {"connected": True, "upcoming_event": None},
+        },
+    )
+
+    rendered = planner._serialize_contact_for_prompt(contact)  # noqa: SLF001
+
+    assert "Coordinar fecha y hora para demo comercial." in rendered
+    assert "2026-05-02 - Usa Excel para seguimiento." in rendered
+    assert "raw_properties" not in rendered
+    assert "Fabian Cuero Villegas" in rendered
+
+
 def test_repair_actions_does_not_guess_stage_when_llm_omits_it():
     planner = build_planner()
     result = PlanningResult(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -67,6 +67,12 @@ def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
             seen.add(normalized)
             merged.append(normalized)
     return merged[-limit:]
+
+
+def _ensure_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _is_playground_event(event: InboundMessage) -> bool:
@@ -177,7 +183,10 @@ class SalesAgentApplication:
                 self.settings.google_calendar_self_schedule_url,
             )
 
-            conversation_recent = await self.memory_store.get_recent_messages(anchor_event.conversation_id, limit=12)
+            conversation_recent = await self.memory_store.get_recent_messages(
+                anchor_event.conversation_id,
+                limit=self.settings.recent_message_context_limit,
+            )
             conversation_recent = [
                 message
                 for message in conversation_recent
@@ -185,16 +194,38 @@ class SalesAgentApplication:
             ]
             lead_recent: list[ConversationMessage] = []
             semantic_memory_groups: list[list[str]] = [
-                await self.memory_store.search_memories(anchor_event.conversation_id, combined_text)
+                await self.memory_store.search_memories(
+                    anchor_event.conversation_id,
+                    combined_text,
+                    limit=self.settings.semantic_memory_limit,
+                )
             ]
             if not _is_playground_event(anchor_event):
-                lead_recent = await self.memory_store.get_recent_messages_by_phone(anchor_event.phone_number, limit=12)
-                lead_recent = [message for message in lead_recent if message.message_id not in batch_message_ids]
-                semantic_memory_groups.append(
-                    await self.memory_store.search_memories_by_phone(anchor_event.phone_number, combined_text)
+                lead_recent = await self.memory_store.get_recent_messages_by_phone(
+                    anchor_event.phone_number,
+                    limit=max(self.settings.recent_message_context_limit * 2, self.settings.recent_message_context_limit),
                 )
-            recent_messages = _merge_unique_messages(conversation_recent, lead_recent, limit=12)
-            semantic_memories = _merge_unique_texts(*semantic_memory_groups, limit=6)
+                lead_recent = [
+                    message
+                    for message in lead_recent
+                    if message.message_id not in batch_message_ids
+                    and _ensure_utc_datetime(message.created_at)
+                    >= _ensure_utc_datetime(anchor_event.timestamp) - timedelta(days=self.settings.phone_context_max_age_days)
+                ]
+                if lead_recent:
+                    semantic_memory_groups.append(
+                        await self.memory_store.search_memories_by_phone(
+                            anchor_event.phone_number,
+                            combined_text,
+                            limit=self.settings.semantic_memory_limit,
+                        )
+                    )
+            recent_messages = _merge_unique_messages(
+                conversation_recent,
+                lead_recent,
+                limit=self.settings.recent_message_context_limit,
+            )
+            semantic_memories = _merge_unique_texts(*semantic_memory_groups, limit=self.settings.semantic_memory_limit)
             planning = planning_override or await self.workflow.planner.plan(
                 text=combined_text,
                 contact=contact,

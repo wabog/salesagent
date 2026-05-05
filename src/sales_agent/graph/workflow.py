@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
@@ -39,6 +40,12 @@ def _merge_unique_texts(*text_groups: list[str], limit: int) -> list[str]:
             seen.add(normalized)
             merged.append(normalized)
     return merged[-limit:]
+
+
+def _ensure_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 class SalesAgentWorkflow:
@@ -150,13 +157,29 @@ class SalesAgentWorkflow:
         return state
 
     async def _load_conversation_context(self, state: AgentState) -> AgentState:
-        conversation_recent = await self.memory.get_recent_messages(state["event"].conversation_id)
-        lead_recent = await self.memory.get_recent_messages_by_phone(state["event"].phone_number)
-        recent = _merge_unique_messages(conversation_recent, lead_recent, limit=12)
+        context_limit = getattr(getattr(self.planner, "_settings", None), "recent_message_context_limit", 24)
+        semantic_limit = getattr(getattr(self.planner, "_settings", None), "semantic_memory_limit", 10)
+        phone_context_max_age_days = getattr(getattr(self.planner, "_settings", None), "phone_context_max_age_days", 14)
+        conversation_recent = await self.memory.get_recent_messages(state["event"].conversation_id, limit=context_limit)
+        lead_recent = await self.memory.get_recent_messages_by_phone(
+            state["event"].phone_number,
+            limit=max(context_limit * 2, context_limit),
+        )
+        lead_recent = [
+            message
+            for message in lead_recent
+            if _ensure_utc_datetime(message.created_at)
+            >= _ensure_utc_datetime(state["event"].timestamp) - timedelta(days=phone_context_max_age_days)
+        ]
+        recent = _merge_unique_messages(conversation_recent, lead_recent, limit=context_limit)
         memories = _merge_unique_texts(
-            await self.memory.search_memories(state["event"].conversation_id, state["event"].text),
-            await self.memory.search_memories_by_phone(state["event"].phone_number, state["event"].text),
-            limit=6,
+            await self.memory.search_memories(state["event"].conversation_id, state["event"].text, limit=semantic_limit),
+            *(
+                [await self.memory.search_memories_by_phone(state["event"].phone_number, state["event"].text, limit=semantic_limit)]
+                if lead_recent
+                else []
+            ),
+            limit=semantic_limit,
         )
         state["recent_messages"] = [message.model_dump(mode="json") for message in recent]
         state["semantic_memories"] = memories

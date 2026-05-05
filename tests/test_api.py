@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -302,6 +302,48 @@ async def test_prepare_batched_run_reuses_recent_messages_from_same_phone_across
     recent_texts = [message.text for message in prepared.recent_messages]
     assert "Necesito revisar una propuesta de Wabog." in recent_texts
     assert "Perfecto, te envio la propuesta y manana hacemos seguimiento." in recent_texts
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_excludes_stale_phone_context_from_old_conversations():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+            PHONE_CONTEXT_MAX_AGE_DAYS=14,
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        memory_store = app.state.sales_agent.memory_store
+        await memory_store.append_message(
+            ConversationMessage(
+                message_id="old-in-1",
+                conversation_id="conv-old",
+                phone_number="3156832405",
+                direction=Direction.INBOUND,
+                text="Hace un mes pedí pricing.",
+                created_at=datetime.now(timezone.utc) - timedelta(days=30),
+            )
+        )
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="new-conv-stale-1",
+                    conversation_id="conv-new",
+                    phone_number="3156832405",
+                    text="hola",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="kapso",
+                )
+            ]
+        )
+
+    recent_texts = [message.text for message in prepared.recent_messages]
+    assert "Hace un mes pedí pricing." not in recent_texts
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import date, datetime, timedelta
@@ -125,7 +126,7 @@ class AgentPlanner:
         knowledge_sections: list[PromptSection] | None = None,
     ) -> PlanningResult:
         prompt = self._compose_llm_prompt(
-            contact_json=contact.model_dump_json(indent=2) if contact else "None",
+            contact_json=self._serialize_contact_for_prompt(contact),
             recent_messages=str(recent_messages),
             semantic_memories=str(semantic_memories),
             knowledge_context=self._render_knowledge_context(knowledge_sections or []),
@@ -169,6 +170,36 @@ class AgentPlanner:
             text,
         ]
         return "\n".join(parts).strip()
+
+    def _serialize_contact_for_prompt(self, contact: CRMContact | None) -> str:
+        if contact is None:
+            return "None"
+        metadata = dict(contact.metadata or {})
+        calendar = dict((metadata.get("calendar") or {}))
+        name_validation = dict((metadata.get("name_validation") or {}))
+        rendered = {
+            "external_id": contact.external_id,
+            "phone_number": contact.phone_number,
+            "full_name": contact.full_name,
+            "stage": contact.stage,
+            "email": contact.email,
+            "followup_summary": contact.followup_summary,
+            "followup_due_date": contact.followup_due_date.isoformat() if contact.followup_due_date else None,
+            "recent_notes": contact.notes[-self._settings.crm_notes_context_limit :],
+            "metadata": {
+                "name_validation": name_validation or None,
+                "calendar": {
+                    "connected": calendar.get("connected"),
+                    "available": calendar.get("available"),
+                    "self_schedule_url": calendar.get("self_schedule_url"),
+                    "upcoming_event": calendar.get("upcoming_event"),
+                    "just_booked": calendar.get("just_booked"),
+                }
+                if calendar
+                else None,
+            },
+        }
+        return json.dumps(rendered, ensure_ascii=False, indent=2)
 
     async def _select_knowledge_sections(
         self,

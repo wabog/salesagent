@@ -241,7 +241,7 @@ class NotionCRMAdapter:
             followup_summary=followup_summary,
             followup_due_date=date.fromisoformat(next_action_date) if next_action_date else None,
             notes=notes,
-            metadata={"raw_properties": properties},
+            metadata={},
         )
 
     @staticmethod
