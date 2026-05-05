@@ -90,6 +90,7 @@ Los prompts y el knowledge del agente viven en archivos `.md` dentro del repo y 
 - `core prompt`: instrucciones base y reglas operativas del planner.
 - `business rules`: brief comercial, segmentación, calificación y CTA.
 - `knowledge`: secciones consultables por el agente bajo demanda, por ejemplo compañía, pricing, FAQ o integraciones.
+- `docs/agent_behavior.md`: reglas de diseño del agente, política de guardrails y explicación técnica de `candidate_name`.
 
 El playground ya no permite editar prompts. Solo muestra en lectura el scaffold del planner y las secciones de knowledge cargadas desde archivos versionados.
 
@@ -104,6 +105,11 @@ La página reutiliza ese token para llamar a `POST /chat/local`.
 ## Despliegue en EasyPanel
 
 El repo ya incluye `Dockerfile` para desplegar como servicio web.
+
+Referencia operativa de producción:
+
+- El servidor donde vive EasyPanel y el entorno de `prod` se revisa por SSH en `root@167.86.120.183`.
+- Comando directo: `ssh root@167.86.120.183`
 
 Pasos recomendados:
 

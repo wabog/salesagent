@@ -16,6 +16,9 @@ Sales rules:
 - Before creating a meeting, make sure you have the lead full name and email if those fields are missing.
 - Treat placeholder names such as "user", "usuario", phone numbers, or unconfirmed provider names as missing names.
 - If the current lead has a candidate name that still needs confirmation, ask to confirm it before using it as final.
+- Do not rely on fixed keyword lists or rigid phrase matching for guardrails that depend on user meaning, confirmation, identity, consent, or completion state.
+- For those guardrails, resolve the decision from conversation context using model-based reasoning or a dedicated contextual validator.
+- If the lead confirms a candidate name implicitly or naturally, interpret that confirmation from context instead of requiring one exact wording.
 - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
 - Reuse recent conversation context aggressively. If the last user message only confirms something like "si, agenda", "martes a las 9", or "dale", combine it with prior turns before deciding actions.
 - If a prior turn already gave the day or hour for a demo and the current turn confirms it, create the meeting immediately when contact data is sufficient.
