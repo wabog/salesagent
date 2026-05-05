@@ -40,6 +40,16 @@ async def test_name_validator_trusts_multi_token_human_name():
     assert result.normalized_name == "Juan David Perez"
 
 
+@pytest.mark.asyncio
+async def test_name_validator_trusts_name_with_middle_initial():
+    validator = ContactNameValidator(Settings(OPENAI_API_KEY=""))
+
+    result = await validator.assess_provider_name("fabian c villegas")
+
+    assert result.status == "trusted"
+    assert result.normalized_name == "Fabian C Villegas"
+
+
 def test_contact_name_helpers_use_persisted_validation_status():
     contact = CRMContact(
         external_id="lead-1",

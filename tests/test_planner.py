@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import ActionType, CRMContact, PlanningResult, ProposedAction
+from sales_agent.services.name_validation import NameConfirmationDecision
 from sales_agent.services.planner import AgentPlanner
 
 
@@ -213,6 +214,124 @@ def test_planning_guardrail_requests_name_and_email_before_creating_meeting():
     assert all(action.type != ActionType.CREATE_MEETING for action in guarded.actions)
     assert "nombre completo" in guarded.response_text.lower()
     assert "correo" in guarded.response_text.lower()
+
+
+def test_repair_actions_uses_contextual_name_confirmation_to_fill_full_name():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Juan Perez",
+        email="fabian@example.com",
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Fabian C Villegas",
+                "normalized_name": "Fabian C Villegas",
+                "source": "provider_llm",
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="confirm_name",
+        confidence=0.81,
+        response_text="Perfecto. Antes de agendarla, ¿tu nombre es Fabian C Villegas?",
+        actions=[
+            ProposedAction(
+                type=ActionType.UPDATE_CONTACT_FIELDS,
+                reason="Confirmación pendiente del nombre.",
+                args={"fields": {}},
+            )
+        ],
+    )
+
+    repaired = planner._repair_actions(  # noqa: SLF001
+        result,
+        "Ese es mi nombre agendala.",
+        contact,
+        [],
+        NameConfirmationDecision(
+            status="confirmed_candidate_name",
+            confidence=0.97,
+            resolved_name="Fabian C Villegas",
+        ),
+    )
+
+    update_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
+    assert update_action.args["fields"]["full_name"] == "Fabian C Villegas"
+
+
+def test_planning_guardrail_creates_meeting_after_contextual_name_confirmation():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Juan Perez",
+        email="fabiancuerov@gmail.com",
+        stage="Primer contacto",
+        followup_summary="Coordinar fecha y hora para demo comercial.",
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Fabian C Villegas",
+                "normalized_name": "Fabian C Villegas",
+                "source": "provider_llm",
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="confirm_demo",
+        confidence=0.79,
+        response_text="Perfecto. Antes de agendarla, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo.",
+        actions=[
+            ProposedAction(
+                type=ActionType.UPDATE_CONTACT_FIELDS,
+                reason="Confirmación de nombre y correo para agendar demo",
+                args={"fields": {}},
+            ),
+            ProposedAction(
+                type=ActionType.COMPLETE_FOLLOWUP,
+                reason="Demo confirmada para mañana a las 10am",
+                args={"outcome": "Ese es mi nombre agendala."},
+            ),
+        ],
+    )
+
+    repaired = planner._repair_actions(  # noqa: SLF001
+        result,
+        "Ese es mi nombre agendala.",
+        contact,
+        [
+            "Perfecto, Juan. Para agendar la demo necesito confirmar la fecha y hora que te convienen.",
+            "mañana a las 10am mi correo es fabiancuerov@gmail.com",
+            "Perfecto. Antes de agendarla, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo.",
+        ],
+        NameConfirmationDecision(
+            status="confirmed_candidate_name",
+            confidence=0.97,
+            resolved_name="Fabian C Villegas",
+        ),
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        repaired,
+        "Ese es mi nombre agendala.",
+        contact,
+        [
+            "Perfecto, Juan. Para agendar la demo necesito confirmar la fecha y hora que te convienen.",
+            "mañana a las 10am mi correo es fabiancuerov@gmail.com",
+            "Perfecto. Antes de agendarla, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo.",
+        ],
+        NameConfirmationDecision(
+            status="confirmed_candidate_name",
+            confidence=0.97,
+            resolved_name="Fabian C Villegas",
+        ),
+    )
+
+    action_types = [action.type for action in guarded.actions]
+    assert ActionType.UPDATE_CONTACT_FIELDS in action_types
+    assert ActionType.CREATE_MEETING in action_types
 
 
 def test_planning_guardrail_does_not_create_meeting_from_recent_context_when_llm_did_not_request_it():

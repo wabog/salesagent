@@ -12,7 +12,15 @@ from pydantic import BaseModel, Field
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import ActionType
 from sales_agent.domain.models import CRMContact, KnowledgeLookup, PlanningResult, ProposedAction
-from sales_agent.services.name_validation import contact_has_reliable_name, get_name_confirmation_candidate, is_specific_person_name
+from sales_agent.services.name_validation import (
+    ContextualNameConfirmationResolver,
+    NameConfirmationDecision,
+    apply_name_validation_metadata,
+    build_trusted_name_assessment,
+    contact_has_reliable_name,
+    get_name_confirmation_candidate,
+    is_specific_person_name,
+)
 from sales_agent.services.prompt_library import PromptLibrary, PromptSection
 
 
@@ -50,6 +58,7 @@ class AgentPlanner:
     def __init__(self, settings: Settings, prompt_library: PromptLibrary | None = None) -> None:
         self._settings = settings
         self._prompt_library = prompt_library or PromptLibrary()
+        self._name_confirmation_resolver = ContextualNameConfirmationResolver(settings)
         self._llm = None
         self._knowledge_selector_llm = None
         if settings.openai_api_key:
@@ -97,11 +106,15 @@ class AgentPlanner:
                             ]
                         }
                     )
-                repaired = self._repair_actions(result, text, contact, recent_messages)
-                return self._apply_planning_guardrail(repaired, text, contact, recent_messages)
+                name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
+                repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
+                return self._apply_planning_guardrail(repaired, text, contact, recent_messages, name_confirmation)
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
-        return self._plan_with_rules(text, contact)
+        result = self._plan_with_rules(text, contact)
+        name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
+        repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
+        return self._apply_planning_guardrail(repaired, text, contact, recent_messages, name_confirmation)
 
     async def _plan_with_llm(
         self,
@@ -264,8 +277,10 @@ class AgentPlanner:
         text: str,
         contact: CRMContact | None,
         recent_messages: list[str],
+        name_confirmation: NameConfirmationDecision | None = None,
     ) -> PlanningResult:
         repaired_actions: list[ProposedAction] = []
+        contextual_name_applied = False
         for action in result.actions:
             args = dict(action.args)
             if action.type == ActionType.UPDATE_CONTACT_FIELDS:
@@ -277,6 +292,14 @@ class AgentPlanner:
                     normalized_fields["email"] = inferred_email
                 if inferred_name and not normalized_fields.get("full_name"):
                     normalized_fields["full_name"] = inferred_name
+                if (
+                    name_confirmation is not None
+                    and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+                    and name_confirmation.resolved_name
+                    and not normalized_fields.get("full_name")
+                ):
+                    normalized_fields["full_name"] = name_confirmation.resolved_name
+                    contextual_name_applied = True
                 args["fields"] = {
                     key: str(value).strip()
                     for key, value in normalized_fields.items()
@@ -293,6 +316,20 @@ class AgentPlanner:
                     merged_payload.update({key: value for key, value in args.items() if value})
                     args = merged_payload
             repaired_actions.append(action.model_copy(update={"args": args}))
+        if (
+            name_confirmation is not None
+            and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+            and name_confirmation.resolved_name
+            and not contextual_name_applied
+            and (contact is None or (contact.full_name or "").strip() != name_confirmation.resolved_name)
+        ):
+            repaired_actions.append(
+                ProposedAction(
+                    type=ActionType.UPDATE_CONTACT_FIELDS,
+                    reason="Validador contextual confirmó el nombre del lead.",
+                    args={"fields": {"full_name": name_confirmation.resolved_name}},
+                )
+            )
         return result.model_copy(update={"actions": repaired_actions})
 
     def _apply_planning_guardrail(
@@ -301,6 +338,7 @@ class AgentPlanner:
         text: str,
         contact: CRMContact | None,
         recent_messages: list[str] | None = None,
+        name_confirmation: NameConfirmationDecision | None = None,
     ) -> PlanningResult:
         actions: list[ProposedAction] = []
         for action in result.actions:
@@ -351,6 +389,22 @@ class AgentPlanner:
                 )
             )
 
+        if (
+            meeting_payload is not None
+            and not missing_meeting_fields
+            and upcoming_event is None
+            and not any(action.type == ActionType.CREATE_MEETING for action in actions)
+            and name_confirmation is not None
+            and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.CREATE_MEETING,
+                    reason="El validador contextual confirmó la identidad pendiente y el lead pidió agendar con horario concreto.",
+                    args=dict(meeting_payload),
+                )
+            )
+
         if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
 
@@ -387,6 +441,14 @@ class AgentPlanner:
         response_text = self._normalize_trial_response(text, response_text)
 
         return result.model_copy(update={"actions": actions, "response_text": response_text})
+
+    async def _resolve_name_confirmation(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+    ) -> NameConfirmationDecision | None:
+        return await self._name_confirmation_resolver.resolve(text, contact, recent_messages)
 
     def _normalize_trial_response(self, text: str, response_text: str) -> str:
         lowered = text.lower()
@@ -541,6 +603,10 @@ class AgentPlanner:
             projected.email = explicit_email
         if explicit_name:
             projected.full_name = explicit_name
+            projected = apply_name_validation_metadata(
+                projected,
+                build_trusted_name_assessment(explicit_name, source="user_message"),
+            )
         for action in actions:
             if action.type != ActionType.UPDATE_CONTACT_FIELDS:
                 continue
@@ -550,7 +616,12 @@ class AgentPlanner:
             if str(fields.get("email", "")).strip():
                 projected.email = str(fields["email"]).strip()
             if str(fields.get("full_name", "")).strip():
-                projected.full_name = str(fields["full_name"]).strip()
+                resolved_name = str(fields["full_name"]).strip()
+                projected.full_name = resolved_name
+                projected = apply_name_validation_metadata(
+                    projected,
+                    build_trusted_name_assessment(resolved_name, source="user_message"),
+                )
         return projected
 
     def _build_sales_note(self, text: str, recent_messages: list[str]) -> str:
@@ -1073,17 +1144,15 @@ class AgentPlanner:
             lowered_text,
         )
         if relative_match:
-            day_token, hour_raw, minute_raw, meridiem = relative_match.groups()
-            target_date = base_date if day_token == "hoy" else base_date + timedelta(days=1)
-            hour = int(hour_raw)
-            minute = int(minute_raw or "0")
-            if meridiem == "pm" and hour < 12:
-                hour += 12
-            elif meridiem == "am" and hour == 12:
-                hour = 0
-            elif meridiem is None and 1 <= hour <= 7:
-                hour += 12
-            return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+            return self._build_relative_datetime(relative_match.groups(), base_date, tz)
+
+        for previous_message in reversed(lowered_context_messages):
+            relative_match = re.search(
+                r"\b(hoy|mañana|manana)\b(?:.*?)(?:a\s+las\s+|a\s+la\s+|tipo\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+                previous_message,
+            )
+            if relative_match:
+                return self._build_relative_datetime(relative_match.groups(), base_date, tz)
 
         isoish_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})[ t](\d{1,2}):(\d{2})\b", lowered_text)
         if isoish_match:
@@ -1145,3 +1214,21 @@ class AgentPlanner:
                 hour = 12
             return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
         return None
+
+    def _build_relative_datetime(
+        self,
+        match_groups: tuple[str, str, str | None, str | None],
+        base_date: date,
+        tz: ZoneInfo,
+    ) -> datetime:
+        day_token, hour_raw, minute_raw, meridiem = match_groups
+        target_date = base_date if day_token == "hoy" else base_date + timedelta(days=1)
+        hour = int(hour_raw)
+        minute = int(minute_raw or "0")
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif meridiem is None and 1 <= hour <= 7:
+            hour += 12
+        return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)

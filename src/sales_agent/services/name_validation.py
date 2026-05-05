@@ -25,6 +25,19 @@ class NameCandidateAssessment(BaseModel):
     source: str = "provider"
 
 
+class NameConfirmationDecision(BaseModel):
+    status: str = "unclear"
+    confidence: float = 0.0
+    resolved_name: str | None = None
+    source: str = "contextual_validator"
+
+
+class NameConfirmationOutput(BaseModel):
+    decision: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    resolved_name: str | None = None
+
+
 _GENERIC_NAMES = {
     "",
     "~",
@@ -82,9 +95,10 @@ def is_specific_person_name(value: str | None) -> bool:
         return False
     if any(token in _NON_NAME_TOKENS for token in tokens):
         return False
-    if any(not re.fullmatch(r"[a-zñ'-]{2,30}", token) for token in tokens):
+    if any(not re.fullmatch(r"[a-zñ'-]{1,30}", token) for token in tokens):
         return False
-    return True
+    long_tokens = [token for token in tokens if re.fullmatch(r"[a-zñ'-]{2,30}", token)]
+    return len(long_tokens) >= 2
 
 
 def contact_has_reliable_name(contact: CRMContact | None) -> bool:
@@ -232,4 +246,61 @@ class ContactNameValidator:
             normalized_name=normalize_person_name(output.normalized_name or normalized_name),
             candidate_name=normalize_person_name(output.normalized_name or normalized_name),
             source="provider_llm",
+        )
+
+
+class ContextualNameConfirmationResolver:
+    def __init__(self, settings: Settings) -> None:
+        self._llm = None
+        if settings.openai_api_key:
+            self._llm = ChatOpenAI(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                temperature=0.0,
+            ).with_structured_output(NameConfirmationOutput, method="function_calling")
+
+    async def resolve(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+    ) -> NameConfirmationDecision | None:
+        candidate_name = get_name_confirmation_candidate(contact)
+        if contact is None or not candidate_name or self._llm is None:
+            return None
+
+        prompt = "\n".join(
+            [
+                "You are validating whether a sales lead confirmed a candidate name from conversation context.",
+                "Return one decision only:",
+                "- confirmed_candidate_name",
+                "- provided_new_name",
+                "- rejected_candidate_name",
+                "- unclear",
+                "Use context, not keywords.",
+                "Only use provided_new_name when the lead explicitly gave a different real name.",
+                "Use confirmed_candidate_name when the lead naturally confirms the candidate suggested by the agent.",
+                "",
+                f"Current CRM full_name: {(contact.full_name or '').strip() or 'None'}",
+                f"Candidate name pending confirmation: {candidate_name}",
+                f"Recent conversation: {recent_messages[-4:]}",
+                f"Latest user message: {text}",
+            ]
+        )
+        try:
+            output = await self._llm.ainvoke(prompt)
+        except OpenAIError:
+            return None
+
+        decision = str(output.decision or "").strip().lower() or "unclear"
+        resolved_name = normalize_person_name(output.resolved_name)
+        if decision == "confirmed_candidate_name":
+            resolved_name = candidate_name
+        if decision != "provided_new_name":
+            resolved_name = resolved_name if decision == "confirmed_candidate_name" else None
+        return NameConfirmationDecision(
+            status=decision,
+            confidence=output.confidence,
+            resolved_name=resolved_name,
+            source="contextual_validator",
         )
