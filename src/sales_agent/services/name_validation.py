@@ -280,6 +280,8 @@ class ContextualNameConfirmationResolver:
                 "Use context, not keywords.",
                 "Only use provided_new_name when the lead explicitly gave a different real name.",
                 "Use confirmed_candidate_name when the lead naturally confirms the candidate suggested by the agent.",
+                "Do not confirm the candidate name if the latest user message only gives scheduling details, email, pricing questions, or any other information that does not directly answer the identity question.",
+                "Continuing the booking flow is not enough by itself to confirm the candidate name.",
                 "",
                 f"Current CRM full_name: {(contact.full_name or '').strip() or 'None'}",
                 f"Candidate name pending confirmation: {candidate_name}",

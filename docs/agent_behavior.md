@@ -6,6 +6,7 @@ This file captures non-negotiable design rules for the Wabog sales agent and sho
 
 - Guardrails must not depend on fixed keyword lists or exact phrase matching when the decision depends on meaning.
 - This applies especially to identity confirmation, consent, completion, schedule confirmation, follow-up completion, and similar conversational states.
+- This also applies to stage progression, trial offers, human handoff, pricing detours during booking, and any other commercial branch that can change the reply or CRM actions.
 - Those decisions must be resolved by contextual reasoning, ideally through a dedicated small validator or mini-agent with scoped input and structured output.
 - Hardcoded keywords may still be acceptable for narrow deterministic parsing such as dates, emails, or phone normalization, but not for semantic confirmation of user intent.
 

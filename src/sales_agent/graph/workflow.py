@@ -205,13 +205,7 @@ class SalesAgentWorkflow:
         for action in planning.actions:
             try:
                 if action.type == ActionType.UPDATE_STAGE and not action.args.get("stage"):
-                    inferred_stage = self.planner._infer_stage_from_text(  # noqa: SLF001
-                        state["event"].text,
-                        current_lead.stage if current_lead and current_lead.stage else "Prospecto",
-                        [message["text"] for message in state["recent_messages"]],
-                    )
-                    if inferred_stage:
-                        action = action.model_copy(update={"args": {**action.args, "stage": inferred_stage}})
+                    continue
                 self.policy.validate(action)
                 if action.type == ActionType.UPDATE_STAGE:
                     current_lead = await scoped_tools.update_stage(action.args["stage"])

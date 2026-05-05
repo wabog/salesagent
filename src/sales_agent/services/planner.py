@@ -319,6 +319,7 @@ class AgentPlanner:
                 "Set should_complete_followup only when the latest user turn clearly means an existing follow-up is already done.",
                 "Set should_handoff_human only when the latest user turn clearly asks for a human or manual intervention.",
                 "Set should_offer_trial_response only when the latest user turn is clearly asking how to try, test, or start using Wabog.",
+                "Do not set should_offer_trial_response for generic questions about how Wabog works, objections about change, or pricing questions.",
                 "If the user only mentions a word inside their name, email, or other contact data, do not trigger a commercial intent from that word.",
                 "",
                 "Current CRM contact:",
@@ -403,13 +404,18 @@ class AgentPlanner:
     ) -> PlanningResult:
         repaired_actions: list[ProposedAction] = []
         contextual_name_applied = False
+        explicit_contact_fields: dict[str, str] = {}
+        inferred_email = self._extract_email(text)
+        inferred_name = self._extract_explicit_name(text)
+        if inferred_email and (contact is None or (contact.email or "").strip() != inferred_email):
+            explicit_contact_fields["email"] = inferred_email
+        if inferred_name and (contact is None or (contact.full_name or "").strip() != inferred_name):
+            explicit_contact_fields["full_name"] = inferred_name
         for action in result.actions:
             args = dict(action.args)
             if action.type == ActionType.UPDATE_CONTACT_FIELDS:
                 fields = args.get("fields")
                 normalized_fields = dict(fields) if isinstance(fields, dict) else {}
-                inferred_email = self._extract_email(text)
-                inferred_name = self._extract_explicit_name(text)
                 if inferred_email and not normalized_fields.get("email"):
                     normalized_fields["email"] = inferred_email
                 if inferred_name and not normalized_fields.get("full_name"):
@@ -427,6 +433,9 @@ class AgentPlanner:
                     for key, value in normalized_fields.items()
                     if key in {"email", "full_name"} and str(value).strip()
                 }
+                for key in tuple(explicit_contact_fields):
+                    if args["fields"].get(key):
+                        explicit_contact_fields.pop(key, None)
             if action.type == ActionType.COMPLETE_FOLLOWUP:
                 existing_outcome = str(args.get("outcome", "")).strip()
                 if not existing_outcome:
@@ -450,6 +459,14 @@ class AgentPlanner:
                     type=ActionType.UPDATE_CONTACT_FIELDS,
                     reason="Validador contextual confirmó el nombre del lead.",
                     args={"fields": {"full_name": name_confirmation.resolved_name}},
+                )
+            )
+        if explicit_contact_fields:
+            repaired_actions.append(
+                ProposedAction(
+                    type=ActionType.UPDATE_CONTACT_FIELDS,
+                    reason="El mensaje contiene datos de contacto explícitos que deben persistirse aunque el modelo no haya emitido la acción.",
+                    args={"fields": explicit_contact_fields},
                 )
             )
         return result.model_copy(update={"actions": repaired_actions})

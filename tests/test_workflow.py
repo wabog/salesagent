@@ -290,13 +290,10 @@ async def test_workflow_repairs_missing_stage_during_tool_execution():
                     ProposedAction(
                         type=ActionType.UPDATE_STAGE,
                         reason="El lead confirmó que quiere avanzar.",
-                        args={},
+                        args={"stage": "Demo agendada"},
                     )
                 ],
             )
-
-        def _infer_stage_from_text(self, text, current_stage, recent_messages):  # noqa: ANN001
-            return "Demo agendada"
 
     workflow = SalesAgentWorkflow(
         crm_adapter=crm,
@@ -360,10 +357,6 @@ async def test_workflow_preserves_calendar_metadata_after_meeting_creation_and_c
                     ),
                 ],
             )
-
-        def _infer_stage_from_text(self, text, current_stage, recent_messages):  # noqa: ANN001
-            return "Demo agendada"
-
     workflow = SalesAgentWorkflow(
         crm_adapter=crm,
         memory_store=memory,

@@ -17,6 +17,7 @@ Sales rules:
 - Treat placeholder names such as "user", "usuario", phone numbers, or unconfirmed provider names as missing names.
 - If the current lead has a candidate name that still needs confirmation, ask to confirm it before using it as final.
 - Do not rely on fixed keyword lists or rigid phrase matching for guardrails that depend on user meaning, confirmation, identity, consent, or completion state.
+- The same rule applies to commercial branching such as stage changes, trial offers, handoff to humans, follow-up completion, or switching topic from booking to pricing.
 - For those guardrails, resolve the decision from conversation context using model-based reasoning or a dedicated contextual validator.
 - If the lead confirms a candidate name implicitly or naturally, interpret that confirmation from context instead of requiring one exact wording.
 - If date and time are already defined but name or email are still missing, ask for the missing fields instead of saying the invite was sent.
