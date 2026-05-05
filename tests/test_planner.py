@@ -363,6 +363,37 @@ def test_planning_guardrail_creates_meeting_after_contextual_name_confirmation()
     assert ActionType.CREATE_MEETING in action_types
 
 
+def test_planning_guardrail_does_not_retry_booking_on_unrelated_price_turn():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Laura Gómez",
+        email="laura@example.com",
+        stage="Primer contacto",
+    )
+    result = PlanningResult(
+        intent="consulta precio",
+        confidence=0.82,
+        response_text="El plan Enterprise se revisa con ventas según volumen y operación.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "y eso cuanto vale",
+        contact,
+        [
+            "Perfecto, agendemos la demo para mañana a las 10 am. Antes de confirmar, necesito que me confirmes tu nombre completo y correo electrónico.",
+            "mi nombre es Laura Gómez",
+            "mi correo es laura@example.com",
+        ],
+    )
+
+    assert all(action.type != ActionType.CREATE_MEETING for action in guarded.actions)
+    assert "enterprise" in guarded.response_text.lower()
+
+
 def test_planning_guardrail_does_not_create_meeting_from_recent_context_when_llm_did_not_request_it():
     planner = build_planner()
     contact = CRMContact(

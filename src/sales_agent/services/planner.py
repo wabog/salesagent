@@ -411,6 +411,7 @@ class AgentPlanner:
             and upcoming_event is None
             and not any(action.type == ActionType.CREATE_MEETING for action in actions)
             and not actions
+            and self._current_turn_can_finish_booking(text, name_confirmation)
         ):
             actions.append(
                 ProposedAction(
@@ -427,6 +428,7 @@ class AgentPlanner:
             and not any(action.type == ActionType.CREATE_MEETING for action in actions)
             and name_confirmation is not None
             and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+            and self._current_turn_can_finish_booking(text, name_confirmation)
         ):
             actions.append(
                 ProposedAction(
@@ -480,6 +482,26 @@ class AgentPlanner:
         recent_messages: list[str],
     ) -> NameConfirmationDecision | None:
         return await self._name_confirmation_resolver.resolve(text, contact, recent_messages)
+
+    def _current_turn_can_finish_booking(
+        self,
+        text: str,
+        name_confirmation: NameConfirmationDecision | None = None,
+    ) -> bool:
+        lowered = text.lower().strip()
+        if re.search(
+            r"\b(hoy|mañana|manana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b",
+            lowered,
+        ) and re.search(r"\b\d{1,2}(?::\d{2})?\s*(am|pm)?\b", lowered):
+            return True
+        if self._extract_email(text) is not None:
+            return True
+        if self._extract_explicit_name(text) is not None:
+            return True
+        return bool(
+            name_confirmation is not None
+            and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+        )
 
     def _normalize_trial_response(self, text: str, response_text: str) -> str:
         lowered = text.lower()
