@@ -3,8 +3,8 @@ from datetime import date, timedelta
 
 from sales_agent.core.config import Settings
 from sales_agent.domain.models import ActionType, CRMContact, PlanningResult, ProposedAction
+from sales_agent.services.planner import AgentPlanner, SemanticGuardrailDecision
 from sales_agent.services.name_validation import NameConfirmationDecision
-from sales_agent.services.planner import AgentPlanner
 
 
 def build_planner() -> AgentPlanner:
@@ -460,6 +460,10 @@ def test_planning_guardrail_synthesizes_trial_stage_when_llm_omits_it():
         "quiero probarlo",
         contact,
         ["manejamos 5 procesos al mes", "cuanto cuesta"],
+        semantic_guardrail=SemanticGuardrailDecision(
+            inferred_stage="Prueba / Trial",
+            stage_confidence=0.91,
+        ),
     )
 
     stage_action = next(action for action in guarded.actions if action.type == ActionType.UPDATE_STAGE)
@@ -483,6 +487,10 @@ def test_planning_guardrail_normalizes_trial_response_to_public_wabog_link():
         "como lo pruebo",
         None,
         ["manejo 5 procesos al mes"],
+        semantic_guardrail=SemanticGuardrailDecision(
+            should_offer_trial_response=True,
+            trial_confidence=0.93,
+        ),
     )
 
     assert "https://wabog.com" in guarded.response_text
@@ -632,8 +640,12 @@ def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
 
 
 @pytest.mark.asyncio
-async def test_hard_rule_answers_name_from_current_contact():
+async def test_contextual_special_case_answers_name_from_current_contact():
     planner = build_planner()
+    planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
+        special_case_intent="ask_name",
+        special_case_confidence=0.97,
+    )
     contact = CRMContact(
         external_id="lead-1",
         phone_number="3150000000",
@@ -648,8 +660,12 @@ async def test_hard_rule_answers_name_from_current_contact():
 
 
 @pytest.mark.asyncio
-async def test_hard_rule_asks_for_name_when_contact_name_is_missing_or_placeholder():
+async def test_contextual_special_case_asks_for_name_when_contact_name_is_missing_or_placeholder():
     planner = build_planner()
+    planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
+        special_case_intent="ask_name",
+        special_case_confidence=0.97,
+    )
     contact = CRMContact(
         external_id="lead-1",
         phone_number="3150000000",
@@ -664,8 +680,12 @@ async def test_hard_rule_asks_for_name_when_contact_name_is_missing_or_placehold
 
 
 @pytest.mark.asyncio
-async def test_hard_rule_asks_to_confirm_candidate_name_when_it_is_not_trusted_yet():
+async def test_contextual_special_case_asks_to_confirm_candidate_name_when_it_is_not_trusted_yet():
     planner = build_planner()
+    planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
+        special_case_intent="ask_name",
+        special_case_confidence=0.97,
+    )
     contact = CRMContact(
         external_id="lead-1",
         phone_number="3150000000",
@@ -689,8 +709,12 @@ async def test_hard_rule_asks_to_confirm_candidate_name_when_it_is_not_trusted_y
 
 
 @pytest.mark.asyncio
-async def test_hard_rule_does_not_treat_phone_number_as_contact_name():
+async def test_contextual_special_case_does_not_treat_phone_number_as_contact_name():
     planner = build_planner()
+    planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
+        special_case_intent="ask_name",
+        special_case_confidence=0.97,
+    )
     contact = CRMContact(
         external_id="lead-1",
         phone_number="3150000000",
@@ -704,8 +728,12 @@ async def test_hard_rule_does_not_treat_phone_number_as_contact_name():
 
 
 @pytest.mark.asyncio
-async def test_hard_rule_distinguishes_contact_source_questions():
+async def test_contextual_special_case_distinguishes_contact_source_questions():
     planner = build_planner()
+    planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
+        special_case_intent="ask_contact_source",
+        special_case_confidence=0.96,
+    )
 
     result = await planner.plan("de donde sacaron mi numero?", None, [], [])
 
@@ -794,6 +822,44 @@ class _FakeKnowledgeSelector:
                     "section_names": ["wabog_pricing"],
                     "reason": "Pricing question.",
                 }
+
+        return _Response()
+
+
+class _FakeSemanticGuardrailLLM:
+    def __init__(
+        self,
+        *,
+        special_case_intent: str = "none",
+        special_case_confidence: float = 0.0,
+        inferred_stage: str | None = None,
+        stage_confidence: float = 0.0,
+        should_complete_followup: bool = False,
+        complete_followup_confidence: float = 0.0,
+        should_handoff_human: bool = False,
+        handoff_confidence: float = 0.0,
+        should_offer_trial_response: bool = False,
+        trial_confidence: float = 0.0,
+    ) -> None:
+        self.payload = {
+            "special_case_intent": special_case_intent,
+            "special_case_confidence": special_case_confidence,
+            "inferred_stage": inferred_stage,
+            "stage_confidence": stage_confidence,
+            "should_complete_followup": should_complete_followup,
+            "complete_followup_confidence": complete_followup_confidence,
+            "should_handoff_human": should_handoff_human,
+            "handoff_confidence": handoff_confidence,
+            "should_offer_trial_response": should_offer_trial_response,
+            "trial_confidence": trial_confidence,
+        }
+
+    async def ainvoke(self, prompt: str):
+        payload = dict(self.payload)
+
+        class _Response:
+            def model_dump(self_nonlocal):  # noqa: ANN001
+                return payload
 
         return _Response()
 

@@ -181,6 +181,26 @@ async def test_workflow_updates_contact_fields_from_explicit_user_data():
 async def test_workflow_persists_followup_summary_and_due_date():
     workflow, crm, _ = await build_workflow()
     await crm.create_contact("573001119901", "Lead Followup")
+    
+    class StubPlanner:
+        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
+            return PlanningResult(
+                intent="followup",
+                confidence=0.88,
+                response_text="Dejé creado un seguimiento para este lead.",
+                actions=[
+                    ProposedAction(
+                        type=ActionType.CREATE_FOLLOWUP,
+                        reason="Solicitud explícita de seguimiento validada por el clasificador contextual.",
+                        args={
+                            "summary": "recordarme mañana enviar la propuesta",
+                            "due_date": (date.today() + timedelta(days=1)).isoformat(),
+                        },
+                    )
+                ],
+            )
+
+    workflow.planner = StubPlanner()
 
     event = InboundMessage(
         message_id="followup-1",
@@ -211,6 +231,23 @@ async def test_workflow_completes_followup_and_logs_timeline_note():
     workflow, crm, _ = await build_workflow()
     created = await crm.create_contact("573001119902", "Lead Followup")
     await crm.create_followup(created.external_id, "Enviar propuesta comercial.", due_date="2026-04-16")
+    
+    class StubPlanner:
+        async def plan(self, text, contact, recent_messages, semantic_memories):  # noqa: ANN001
+            return PlanningResult(
+                intent="followup_completed",
+                confidence=0.9,
+                response_text="Perfecto. Marco como completado el seguimiento activo.",
+                actions=[
+                    ProposedAction(
+                        type=ActionType.COMPLETE_FOLLOWUP,
+                        reason="Confirmación contextual de que la tarea pendiente ya se completó.",
+                        args={"outcome": "listo, ya envié la propuesta."},
+                    )
+                ],
+            )
+
+    workflow.planner = StubPlanner()
 
     event = InboundMessage(
         message_id="followup-complete-1",

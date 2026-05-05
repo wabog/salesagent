@@ -42,6 +42,32 @@ class KnowledgeSelectionOutput(BaseModel):
     reason: str = ""
 
 
+class SemanticGuardrailOutput(BaseModel):
+    special_case_intent: str = "none"
+    special_case_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    inferred_stage: str | None = None
+    stage_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    should_complete_followup: bool = False
+    complete_followup_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    should_handoff_human: bool = False
+    handoff_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    should_offer_trial_response: bool = False
+    trial_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class SemanticGuardrailDecision(BaseModel):
+    special_case_intent: str = "none"
+    special_case_confidence: float = 0.0
+    inferred_stage: str | None = None
+    stage_confidence: float = 0.0
+    should_complete_followup: bool = False
+    complete_followup_confidence: float = 0.0
+    should_handoff_human: bool = False
+    handoff_confidence: float = 0.0
+    should_offer_trial_response: bool = False
+    trial_confidence: float = 0.0
+
+
 class AgentPlanner:
     _STAGE_ORDER = {
         "Prospecto": 0,
@@ -62,6 +88,7 @@ class AgentPlanner:
         self._name_confirmation_resolver = ContextualNameConfirmationResolver(settings)
         self._llm = None
         self._knowledge_selector_llm = None
+        self._semantic_guardrail_llm = None
         if settings.openai_api_key:
             base_llm = ChatOpenAI(
                 api_key=settings.openai_api_key,
@@ -73,6 +100,10 @@ class AgentPlanner:
                 KnowledgeSelectionOutput,
                 method="function_calling",
             )
+            self._semantic_guardrail_llm = base_llm.with_structured_output(
+                SemanticGuardrailOutput,
+                method="function_calling",
+            )
 
     async def plan(
         self,
@@ -81,9 +112,9 @@ class AgentPlanner:
         recent_messages: list[str],
         semantic_memories: list[str],
     ) -> PlanningResult:
-        hard_rule_result = self._apply_hard_rules(text, contact)
-        if hard_rule_result is not None:
-            return hard_rule_result
+        semantic_guardrail = await self._resolve_semantic_guardrails(text, contact, recent_messages)
+        if semantic_guardrail.special_case_intent != "none":
+            return self._build_special_case_result(semantic_guardrail, contact)
         if self._llm is not None:
             try:
                 selection = await self._select_knowledge_sections(text, contact, recent_messages)
@@ -109,13 +140,27 @@ class AgentPlanner:
                     )
                 name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
                 repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
-                return self._apply_planning_guardrail(repaired, text, contact, recent_messages, name_confirmation)
+                return self._apply_planning_guardrail(
+                    repaired,
+                    text,
+                    contact,
+                    recent_messages,
+                    name_confirmation,
+                    semantic_guardrail,
+                )
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
         result = self._plan_with_rules(text, contact)
         name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
         repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
-        return self._apply_planning_guardrail(repaired, text, contact, recent_messages, name_confirmation)
+        return self._apply_planning_guardrail(
+            repaired,
+            text,
+            contact,
+            recent_messages,
+            name_confirmation,
+            semantic_guardrail,
+        )
 
     async def _plan_with_llm(
         self,
@@ -255,15 +300,65 @@ class AgentPlanner:
             )
         return "\n".join(rendered).strip()
 
-    def _apply_hard_rules(self, text: str, contact: CRMContact | None) -> PlanningResult | None:
-        normalized = self._normalize_lookup_text(text)
-        if normalized in {
-            "como me llamo",
-            "cual es mi nombre",
-            "que nombre tienes mio",
-            "que nombre tienes de mi",
-            "como me tienes guardado",
-        }:
+    async def _resolve_semantic_guardrails(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+    ) -> SemanticGuardrailDecision:
+        if self._semantic_guardrail_llm is None:
+            return SemanticGuardrailDecision()
+
+        prompt = "\n".join(
+            [
+                "You review a single turn in a Spanish-speaking sales conversation for Wabog.",
+                "Use context, not keyword matching.",
+                "Do not infer anything unless the context is clear.",
+                "Allowed special_case_intent values: none, ask_name, ask_contact_source.",
+                "Allowed inferred_stage values: Prospecto, Primer contacto, Demo agendada, Demo realizada, Propuesta enviada, Negociación, Prueba / Trial, Cliente, Perdido, No califica, or null.",
+                "Set should_complete_followup only when the latest user turn clearly means an existing follow-up is already done.",
+                "Set should_handoff_human only when the latest user turn clearly asks for a human or manual intervention.",
+                "Set should_offer_trial_response only when the latest user turn is clearly asking how to try, test, or start using Wabog.",
+                "If the user only mentions a word inside their name, email, or other contact data, do not trigger a commercial intent from that word.",
+                "",
+                "Current CRM contact:",
+                contact.model_dump_json(indent=2) if contact else "None",
+                "",
+                "Recent conversation:",
+                str(recent_messages[-6:]),
+                "",
+                "Latest user message:",
+                text,
+            ]
+        )
+        try:
+            output = await self._semantic_guardrail_llm.ainvoke(prompt)
+        except OpenAIError:
+            return SemanticGuardrailDecision()
+
+        payload = output.model_dump() if hasattr(output, "model_dump") else dict(output)
+        inferred_stage = str(payload.get("inferred_stage") or "").strip() or None
+        if inferred_stage not in self._STAGE_ORDER:
+            inferred_stage = None
+        return SemanticGuardrailDecision(
+            special_case_intent=str(payload.get("special_case_intent") or "none").strip().lower() or "none",
+            special_case_confidence=float(payload.get("special_case_confidence") or 0.0),
+            inferred_stage=inferred_stage,
+            stage_confidence=float(payload.get("stage_confidence") or 0.0),
+            should_complete_followup=bool(payload.get("should_complete_followup")),
+            complete_followup_confidence=float(payload.get("complete_followup_confidence") or 0.0),
+            should_handoff_human=bool(payload.get("should_handoff_human")),
+            handoff_confidence=float(payload.get("handoff_confidence") or 0.0),
+            should_offer_trial_response=bool(payload.get("should_offer_trial_response")),
+            trial_confidence=float(payload.get("trial_confidence") or 0.0),
+        )
+
+    def _build_special_case_result(
+        self,
+        decision: SemanticGuardrailDecision,
+        contact: CRMContact | None,
+    ) -> PlanningResult:
+        if decision.special_case_intent == "ask_name":
             full_name = (contact.full_name or "").strip() if contact else ""
             candidate_name = get_name_confirmation_candidate(contact)
             if contact_has_reliable_name(contact):
@@ -274,25 +369,15 @@ class AgentPlanner:
                 response_text = "Todavía no tengo tu nombre registrado. Si quieres, compártemelo y lo guardo."
             return PlanningResult(
                 intent="ask_name",
-                confidence=0.99,
+                confidence=max(decision.special_case_confidence, 0.9),
                 response_text=response_text,
                 actions=[],
                 should_reply=True,
             )
-
-        if normalized in {
-            "de donde sacaron mi numero",
-            "de donde sacaste mi numero",
-            "como consiguieron mi numero",
-            "como consiguieron mi contacto",
-            "como me llamaron",
-            "como me llamaste",
-            "como me contacto wabog",
-            "porque me escribieron",
-        }:
+        if decision.special_case_intent == "ask_contact_source":
             return PlanningResult(
                 intent="ask_contact_source",
-                confidence=0.96,
+                confidence=max(decision.special_case_confidence, 0.9),
                 response_text=(
                     "Te contactamos porque tu número quedó registrado como posible interesado en soluciones de Wabog "
                     "para abogados y equipos legales. Si prefieres, también te cuento brevemente qué hacemos."
@@ -300,7 +385,13 @@ class AgentPlanner:
                 actions=[],
                 should_reply=True,
             )
-        return None
+        return PlanningResult(
+            intent="generic_reply",
+            confidence=0.0,
+            response_text="",
+            actions=[],
+            should_reply=True,
+        )
 
     def _repair_actions(
         self,
@@ -370,6 +461,7 @@ class AgentPlanner:
         contact: CRMContact | None,
         recent_messages: list[str] | None = None,
         name_confirmation: NameConfirmationDecision | None = None,
+        semantic_guardrail: SemanticGuardrailDecision | None = None,
     ) -> PlanningResult:
         actions: list[ProposedAction] = []
         for action in result.actions:
@@ -441,26 +533,12 @@ class AgentPlanner:
         if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
 
-        inferred_stage = self._infer_stage_from_text(
-            text,
-            contact.stage if contact and contact.stage else "Prospecto",
-            recent_messages,
-        )
-        negative_stage_signal = any(
-            phrase in text.lower()
-            for phrase in (
-                "no quiero",
-                "no me interesa",
-                "no aplica",
-                "no gracias",
-                "despues",
-                "después",
-            )
-        )
+        semantic_guardrail = semantic_guardrail or SemanticGuardrailDecision()
+        inferred_stage = semantic_guardrail.inferred_stage
         if (
             inferred_stage
+            and semantic_guardrail.stage_confidence >= 0.7
             and self._should_update_stage(contact.stage if contact and contact.stage else "Prospecto", inferred_stage)
-            and not negative_stage_signal
             and not any(action.type == ActionType.UPDATE_STAGE for action in actions)
         ):
             actions.append(
@@ -471,7 +549,38 @@ class AgentPlanner:
                 )
             )
 
-        response_text = self._normalize_trial_response(text, response_text)
+        if (
+            semantic_guardrail.should_complete_followup
+            and semantic_guardrail.complete_followup_confidence >= 0.75
+            and contact is not None
+            and contact.followup_summary
+            and not any(action.type == ActionType.COMPLETE_FOLLOWUP for action in actions)
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.COMPLETE_FOLLOWUP,
+                    reason="El validador contextual detectó que el siguiente paso pendiente ya quedó resuelto.",
+                    args={"outcome": self._build_followup_completion_outcome(text, upcoming_event=upcoming_event)},
+                )
+            )
+
+        if (
+            semantic_guardrail.should_handoff_human
+            and semantic_guardrail.handoff_confidence >= 0.75
+            and not any(action.type == ActionType.HANDOFF_HUMAN for action in actions)
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.HANDOFF_HUMAN,
+                    reason="El validador contextual detectó una solicitud clara de intervención humana.",
+                    args={},
+                )
+            )
+
+        if semantic_guardrail.should_offer_trial_response and semantic_guardrail.trial_confidence >= 0.75:
+            response_text = self._build_trial_response(response_text)
+        else:
+            response_text = self._normalize_wabog_urls(response_text)
 
         return result.model_copy(update={"actions": actions, "response_text": response_text})
 
@@ -503,13 +612,12 @@ class AgentPlanner:
             and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
         )
 
-    def _normalize_trial_response(self, text: str, response_text: str) -> str:
-        lowered = text.lower()
-        if not any(token in lowered for token in ("prueba", "pruebo", "probar", "probarlo", "testear")):
-            return self._normalize_wabog_urls(response_text)
+    def _build_trial_response(self, response_text: str) -> str:
         normalized = self._normalize_wabog_urls(response_text)
         wabog_url = "https://wabog.com"
         app_url = "https://app.wabog.com"
+        if wabog_url in normalized and app_url in normalized:
+            return normalized
         return (
             f"Puedes probar Wabog desde {wabog_url}. "
             f"Funciona muy bien a través de WhatsApp para monitoreo y seguimiento. "
@@ -519,108 +627,12 @@ class AgentPlanner:
     def _normalize_wabog_urls(self, response_text: str) -> str:
         return re.sub(r"https://wabog\.com/[^\s)\]]+", "https://wabog.com", response_text)
 
-    def _infer_stage_from_text(self, text: str, current_stage: str, recent_messages: list[str] | None = None) -> str | None:
-        lowered = text.lower()
-        recent_lowered = " ".join(message.lower() for message in (recent_messages or [])[-3:])
-        has_concrete_demo_slot = self._extract_requested_meeting_start(text, recent_messages) is not None
-        affirmative_reply = lowered.strip() in {
-            "si",
-            "sí",
-            "si claro",
-            "sí claro",
-            "claro",
-            "de una",
-            "dale",
-            "hagámosle",
-            "hagamosle",
-            "ok",
-            "vale",
-            "me sirve",
-        }
-        if affirmative_reply:
-            if any(token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-                return "Demo agendada" if has_concrete_demo_slot else "Primer contacto"
-            if any(token in recent_lowered for token in ("trial", "prueba", "probar", "testear")):
-                return "Prueba / Trial"
-        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-            return "Demo agendada" if has_concrete_demo_slot else "Primer contacto"
-        if any(token in lowered for token in ("trial", "prueba", "probar", "testear")):
-            return "Prueba / Trial"
-        if any(token in lowered for token in ("negociación", "negociacion", "negociar", "descuento")):
-            return "Negociación"
-        if any(token in lowered for token in ("propuesta", "cotización", "cotizacion")):
-            return "Propuesta enviada"
-        if any(token in lowered for token in ("no me interesa", "no estoy interesado", "no aplica")):
-            return "No califica"
-        if any(token in lowered for token in ("ya compré", "ya compre", "arranquemos", "vamos a trabajar")):
-            return "Cliente"
-        if any(token in lowered for token in ("precio", "planes", "cuanto cuesta", "costos")) and current_stage == "Prospecto":
-            return "Primer contacto"
-        if current_stage == "Prospecto" and any(
-            token in lowered
-            for token in ("adquirir", "comprar", "quisiera", "quiero", "me interesa", "interesado", "interesada")
-        ):
-            return "Primer contacto"
-        return None
-
     def _should_update_stage(self, current_stage: str, inferred_stage: str) -> bool:
         current_rank = self._STAGE_ORDER.get(current_stage, 0)
         inferred_rank = self._STAGE_ORDER.get(inferred_stage, current_rank)
         if inferred_stage in {"No califica", "Perdido", "Cliente"}:
             return inferred_stage != current_stage
         return inferred_rank > current_rank
-
-    def _should_add_sales_note(self, lowered_text: str, existing_notes: set[str]) -> bool:
-        if existing_notes:
-            return False
-        note_signals = (
-            "precio",
-            "planes",
-            "cotización",
-            "cotizacion",
-            "demo",
-            "reunión",
-            "reunion",
-            "trial",
-            "prueba",
-            "probar",
-            "negociación",
-            "negociacion",
-            "propuesta",
-            "despacho",
-            "firma",
-            "abogada",
-            "abogado",
-        )
-        return any(token in lowered_text for token in note_signals)
-
-    def _should_rewrite_note(self, note: str, text: str) -> bool:
-        normalized_note = self._normalize_text(note)
-        normalized_text = self._normalize_text(text)
-        if not normalized_note:
-            return True
-        if normalized_note == normalized_text:
-            return True
-        if normalized_text and normalized_text in normalized_note and len(normalized_note) <= len(normalized_text) + 40:
-            return True
-        return normalized_note.startswith(
-            (
-                "solicitud de demo",
-                "interés comercial en pricing",
-                "interes comercial en pricing",
-                "interés en trial",
-                "interes en trial",
-            )
-        )
-
-    def _should_rewrite_followup_summary(self, summary: str, text: str) -> bool:
-        normalized_summary = self._normalize_text(summary)
-        normalized_text = self._normalize_text(text)
-        if not normalized_summary:
-            return True
-        if normalized_summary == normalized_text:
-            return True
-        return normalized_summary.startswith(("coordinar demo para lead actual", "contexto:"))
 
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", value.strip().lower())
@@ -772,24 +784,6 @@ class AgentPlanner:
             return "Responder pricing o enviar propuesta comercial."
         return "Dar seguimiento comercial al lead."
 
-    def _infer_followup_due_date(self, text: str, recent_messages: list[str]) -> str:
-        lowered = text.lower()
-        recent_lowered = " ".join(message.lower() for message in recent_messages[-3:])
-        base_date = date.today()
-        if any(token in lowered for token in ("hoy", "esta tarde", "este rato")):
-            return base_date.isoformat()
-        if any(token in lowered for token in ("mañana", "manana")):
-            return (base_date + timedelta(days=1)).isoformat()
-        if "próxima semana" in lowered or "proxima semana" in lowered:
-            return (base_date + timedelta(days=7)).isoformat()
-        if any(token in lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-            return (base_date + timedelta(days=1)).isoformat()
-        if lowered.strip() in {"si", "sí", "si claro", "sí claro", "claro", "de una", "dale", "ok", "vale", "me sirve"} and any(
-            token in recent_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")
-        ):
-            return (base_date + timedelta(days=1)).isoformat()
-        return (base_date + timedelta(days=1)).isoformat()
-
     def _build_meeting_payload(
         self,
         text: str,
@@ -847,23 +841,6 @@ class AgentPlanner:
             return text
         return text[0].upper() + text[1:]
 
-    def _should_create_followup(self, lowered_text: str) -> bool:
-        followup_signals = (
-            "demo",
-            "agendar",
-            "reunión",
-            "reunion",
-            "llamada",
-            "trial",
-            "prueba",
-            "probar",
-            "propuesta",
-            "negociación",
-            "negociacion",
-            "seguimiento",
-        )
-        return any(token in lowered_text for token in followup_signals)
-
     def _missing_contact_fields_for_meeting(self, contact: CRMContact | None) -> list[str]:
         if contact is None:
             return ["full_name", "email"]
@@ -914,55 +891,6 @@ class AgentPlanner:
         if not any(signal in lowered for signal in false_booking_signals):
             return response_text
         return "Perfecto. Revisemos los datos y el horario para dejar la demo correctamente agendada."
-
-    def _should_complete_followup(self, lowered_text: str, contact: CRMContact | None) -> bool:
-        if contact is None or not contact.followup_summary:
-            return False
-        explicit_completion_phrases = (
-            "ya envié",
-            "ya envie",
-            "ya agendé",
-            "ya agende",
-            "ya coordiné",
-            "ya coordine",
-            "ya realicé",
-            "ya realice",
-            "ya quedó",
-            "ya quedo",
-            "ya se envió",
-            "ya se envio",
-            "ya se agendó",
-            "ya se agendo",
-            "ya está hecho",
-            "ya esta hecho",
-            "seguimiento completado",
-            "seguimiento cumplido",
-        )
-        if any(phrase in lowered_text for phrase in explicit_completion_phrases):
-            return True
-        completion_context_markers = (
-            "ya",
-            "listo",
-            "hecho",
-            "complet",
-            "cumpl",
-            "resuelto",
-        )
-        completion_action_markers = (
-            "envié",
-            "envie",
-            "agendé",
-            "agende",
-            "realicé",
-            "realice",
-            "coordiné",
-            "coordine",
-            "cerré",
-            "cerre",
-        )
-        return any(token in lowered_text for token in completion_context_markers) and any(
-            token in lowered_text for token in completion_action_markers
-        )
 
     def _plan_with_rules(self, text: str, contact: CRMContact | None) -> PlanningResult:
         lowered = text.lower()
@@ -1028,46 +956,6 @@ class AgentPlanner:
             intent = "append_note"
             confidence = 0.9
             response_lines.append("Registré la nota en el CRM.")
-
-        if any(token in lowered for token in ("seguimiento", "follow up", "follow-up", "recordarme")):
-            actions.append(
-                ProposedAction(
-                    type=ActionType.CREATE_FOLLOWUP,
-                    reason="El mensaje sugiere programar seguimiento.",
-                    args={
-                        "summary": text.strip(),
-                        "due_date": self._infer_followup_due_date(text, []),
-                    },
-                )
-            )
-            intent = "followup"
-            confidence = max(confidence, 0.8)
-            response_lines.append("Dejé creado un seguimiento para este lead.")
-
-        if self._should_complete_followup(lowered, contact):
-            actions.append(
-                ProposedAction(
-                    type=ActionType.COMPLETE_FOLLOWUP,
-                    reason="El lead indicó que ya se cumplió el siguiente paso pendiente.",
-                    args={"outcome": self._build_followup_completion_outcome(text, upcoming_event=upcoming_event)},
-                )
-            )
-            if intent == "generic_reply":
-                intent = "followup_completed"
-                confidence = max(confidence, 0.78)
-            response_lines.append("Perfecto. Marco como completado el seguimiento activo.")
-
-        if any(token in lowered for token in ("asesor", "humano", "llámame", "llamame")):
-            actions.append(
-                ProposedAction(
-                    type=ActionType.HANDOFF_HUMAN,
-                    reason="El usuario pidió intervención humana.",
-                    args={},
-                )
-            )
-            intent = "handoff"
-            confidence = 0.95
-            response_lines.append("Voy a escalar esta conversación al equipo comercial.")
 
         if not response_lines:
             response_lines.append(
@@ -1159,27 +1047,6 @@ class AgentPlanner:
             flags=re.IGNORECASE,
         )
         return re.sub(r"\s+", " ", cleaned).strip()
-
-    def _should_offer_self_schedule_link(self, lowered_text: str, upcoming_event: dict | None) -> bool:
-        if upcoming_event is not None:
-            return False
-        if self._extract_requested_meeting_start(lowered_text, []) is not None:
-            return False
-        return any(
-            token in lowered_text
-            for token in (
-                "demo",
-                "agendar",
-                "agenda",
-                "reunión",
-                "reunion",
-                "llamada",
-                "calendario",
-                "link",
-                "horario",
-                "disponibilidad",
-            )
-        )
 
     def _extract_requested_meeting_start(self, text: str, recent_messages: list[str] | None = None) -> datetime | None:
         context_messages = [message.strip() for message in (recent_messages or [])[-6:] if message.strip()]
