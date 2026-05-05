@@ -8,6 +8,7 @@ from sales_agent.services.name_validation import (
     NameCandidateAssessment,
     apply_name_validation_metadata,
     contact_has_reliable_name,
+    get_effective_contact_name,
     get_name_confirmation_candidate,
 )
 
@@ -37,7 +38,7 @@ async def test_name_validator_trusts_multi_token_human_name():
 
     result = await validator.assess_provider_name("juan david perez")
 
-    assert result.status == "trusted"
+    assert result.status == "needs_confirmation"
     assert result.normalized_name == "Juan David Perez"
 
 
@@ -47,7 +48,7 @@ async def test_name_validator_trusts_name_with_middle_initial():
 
     result = await validator.assess_provider_name("fabian c villegas")
 
-    assert result.status == "trusted"
+    assert result.status == "needs_confirmation"
     assert result.normalized_name == "Fabian C Villegas"
 
 
@@ -69,6 +70,7 @@ def test_contact_name_helpers_use_persisted_validation_status():
     )
     assert not contact_has_reliable_name(confirmed)
     assert get_name_confirmation_candidate(confirmed) == "Juan"
+    assert get_effective_contact_name(confirmed) is None
 
     trusted = apply_name_validation_metadata(
         confirmed,
@@ -82,6 +84,7 @@ def test_contact_name_helpers_use_persisted_validation_status():
     )
     assert trusted.full_name == "Juan David Perez"
     assert contact_has_reliable_name(trusted)
+    assert get_effective_contact_name(trusted) == "Juan David Perez"
 
 
 class _FakeNameConfirmationLLM:

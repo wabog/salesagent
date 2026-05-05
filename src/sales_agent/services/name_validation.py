@@ -66,6 +66,8 @@ _NON_NAME_TOKENS = {
     "wabog",
 }
 
+_PROVIDER_NAME_SOURCES = {"provider", "provider_llm"}
+
 
 def normalize_person_name(value: str | None) -> str | None:
     cleaned = " ".join((value or "").strip().split())
@@ -106,8 +108,11 @@ def contact_has_reliable_name(contact: CRMContact | None) -> bool:
         return False
     validation = ((contact.metadata or {}).get("name_validation") or {})
     status = str(validation.get("status") or "").strip().lower()
+    source = str(validation.get("source") or "").strip().lower()
     if not status:
         return True
+    if source in _PROVIDER_NAME_SOURCES:
+        return False
     return status in {"trusted", "confirmed", "legacy"}
 
 
@@ -121,6 +126,14 @@ def get_name_confirmation_candidate(contact: CRMContact | None) -> str | None:
     return candidate or None
 
 
+def get_effective_contact_name(contact: CRMContact | None) -> str | None:
+    if contact is None:
+        return None
+    if contact_has_reliable_name(contact):
+        return (contact.full_name or "").strip() or None
+    return None
+
+
 def apply_name_validation_metadata(
     contact: CRMContact,
     assessment: NameCandidateAssessment | None,
@@ -128,6 +141,15 @@ def apply_name_validation_metadata(
     if assessment is None:
         return contact
     metadata = dict(contact.metadata or {})
+    provider_name = (metadata.get("provider_name") or "").strip() or None
+    confirmed_name = (metadata.get("confirmed_name") or "").strip() or None
+    if assessment.source in _PROVIDER_NAME_SOURCES and assessment.normalized_name:
+        provider_name = assessment.normalized_name
+        metadata["provider_name"] = provider_name
+    if assessment.source in _PROVIDER_NAME_SOURCES and confirmed_name:
+        if provider_name and confirmed_name and provider_name == confirmed_name:
+            metadata.pop("provider_name", None)
+        return contact.model_copy(update={"metadata": metadata})
     metadata["name_validation"] = {
         "status": assessment.status,
         "confidence": assessment.confidence,
@@ -136,8 +158,14 @@ def apply_name_validation_metadata(
         "source": assessment.source,
     }
     updated_name = contact.full_name
-    if assessment.status == "trusted" and assessment.normalized_name:
+    if assessment.source not in _PROVIDER_NAME_SOURCES and assessment.status in {"trusted", "confirmed", "legacy"} and assessment.normalized_name:
         updated_name = assessment.normalized_name
+        confirmed_name = assessment.normalized_name
+        metadata["confirmed_name"] = confirmed_name
+    elif confirmed_name:
+        metadata["confirmed_name"] = confirmed_name
+    if provider_name and confirmed_name and provider_name == confirmed_name:
+        metadata.pop("provider_name", None)
     return contact.model_copy(update={"full_name": updated_name, "metadata": metadata})
 
 
@@ -182,7 +210,7 @@ class ContactNameValidator:
 
         if len(tokens) >= 2 and is_specific_person_name(normalized_name):
             return NameCandidateAssessment(
-                status="trusted",
+                status="needs_confirmation",
                 confidence=0.96,
                 normalized_name=normalized_name,
                 candidate_name=normalized_name,
@@ -225,7 +253,7 @@ class ContactNameValidator:
         if output.looks_like_real_name and output.confidence >= 0.9 and is_specific_person_name(output.normalized_name or normalized_name):
             trusted_name = normalize_person_name(output.normalized_name or normalized_name)
             return NameCandidateAssessment(
-                status="trusted",
+                status="needs_confirmation",
                 confidence=output.confidence,
                 normalized_name=trusted_name,
                 candidate_name=trusted_name,

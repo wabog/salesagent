@@ -16,6 +16,7 @@ from sales_agent.domain.models import (
 from sales_agent.domain.state import AgentState
 from sales_agent.services.calendar_sync import enrich_contact_with_calendar, merge_contact_with_shadow
 from sales_agent.services.lead_scope import LeadScopedCRMTools
+from sales_agent.services.name_validation import get_effective_contact_name
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
 
@@ -143,7 +144,7 @@ class SalesAgentWorkflow:
         if contact is None:
             contact = await self.crm.create_contact(
                 phone_number=state["event"].phone_number,
-                full_name=state["event"].contact_name or (shadow.full_name if shadow else None),
+                full_name=get_effective_contact_name(shadow),
             )
             state["lead_created"] = True
         if shadow is not None:

@@ -313,6 +313,26 @@ def test_repair_actions_appends_explicit_contact_fields_even_when_llm_omits_upda
     }
 
 
+def test_repair_actions_extracts_standalone_full_name_message():
+    planner = build_planner()
+    result = PlanningResult(
+        intent="name_correction",
+        confidence=0.8,
+        response_text="Gracias por la corrección.",
+        actions=[],
+    )
+
+    repaired = planner._repair_actions(  # noqa: SLF001
+        result,
+        "Fabian Cuero Villegas",
+        None,
+        ["Tu nombre actual figura como Juan Perez. Si quieres, compárteme tu nombre completo correcto."],
+    )
+
+    update_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
+    assert update_action.args["fields"] == {"full_name": "Fabian Cuero Villegas"}
+
+
 def test_planning_guardrail_creates_meeting_after_contextual_name_confirmation():
     planner = build_planner()
     contact = CRMContact(

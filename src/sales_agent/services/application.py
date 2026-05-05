@@ -37,6 +37,7 @@ from sales_agent.services.name_validation import (
     apply_name_validation_metadata,
     build_trusted_name_assessment,
     contact_has_reliable_name,
+    get_effective_contact_name,
 )
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
@@ -155,26 +156,17 @@ class SalesAgentApplication:
             combined_text, planning_override = await self._build_combined_text(events)
 
             provider_name_assessment = await self.name_validator.assess_provider_name(anchor_event.contact_name)
-            trusted_provider_name = (
-                provider_name_assessment.normalized_name if provider_name_assessment.status == "trusted" else None
-            )
-
             contact = await self.crm_adapter.find_contact_by_phone(anchor_event.phone_number)
             shadow = await self.memory_store.get_contact_shadow(anchor_event.phone_number)
             lead_created = False
             if contact is None:
                 contact = await self.crm_adapter.create_contact(
                     phone_number=anchor_event.phone_number,
-                    full_name=trusted_provider_name or (shadow.full_name if shadow else None),
+                    full_name=get_effective_contact_name(shadow),
                 )
                 lead_created = True
             if shadow is not None:
                 contact = merge_contact_with_shadow(contact, shadow)
-            if trusted_provider_name and not contact_has_reliable_name(contact):
-                contact = await self.crm_adapter.update_contact_fields(
-                    contact.external_id,
-                    {"full_name": trusted_provider_name},
-                )
             if provider_name_assessment.status != "rejected":
                 contact = apply_name_validation_metadata(contact, provider_name_assessment)
             contact = await enrich_contact_with_calendar(
@@ -280,6 +272,7 @@ class SalesAgentApplication:
                                     source="user_message",
                                 ),
                             )
+                            scoped_tools.current_lead = current_lead
                         current_lead = await scoped_tools.update_fields(action.args["fields"])
                         payload = current_lead.model_dump(mode="json")
                     elif action.type == ActionType.APPEND_NOTE and scoped_tools is not None:
@@ -322,6 +315,12 @@ class SalesAgentApplication:
                 )
 
             if current_lead is not None:
+                current_lead = self._refresh_live_context(
+                    current_lead,
+                    combined_text,
+                    recent_texts,
+                    tool_results,
+                )
                 await self.memory_store.remember_contact(current_lead)
 
             await self.memory_store.save_run(
@@ -497,7 +496,7 @@ class SalesAgentApplication:
 
         if failed_meeting is not None:
             missing_fields: list[str] = []
-            if contact is None or not (contact.full_name or "").strip():
+            if contact is None or not contact_has_reliable_name(contact):
                 missing_fields.append("nombre completo")
             if contact is None or not (contact.email or "").strip():
                 missing_fields.append("correo")
@@ -548,3 +547,32 @@ class SalesAgentApplication:
         )
         await scoped_tools.create_followup(summary, due_date=due_date)
         return scoped_tools.current_lead
+
+    def _refresh_live_context(
+        self,
+        contact: CRMContact,
+        combined_text: str,
+        recent_texts: list[str],
+        tool_results: list[ToolExecutionResult],
+    ) -> CRMContact:
+        metadata = dict(contact.metadata or {})
+        live_context = dict((metadata.get("live_context") or {}))
+        has_successful_meeting = any(
+            result.success and result.action.type == ActionType.CREATE_MEETING
+            for result in tool_results
+        )
+        has_upcoming_event = bool((((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")))
+        if has_successful_meeting or has_upcoming_event:
+            live_context.pop("pending_booking_start_iso", None)
+        else:
+            pending_start = self.workflow.planner._extract_requested_meeting_start(  # noqa: SLF001
+                combined_text,
+                recent_texts,
+            )
+            if pending_start is not None:
+                live_context["pending_booking_start_iso"] = pending_start.isoformat()
+        if live_context:
+            metadata["live_context"] = live_context
+        else:
+            metadata.pop("live_context", None)
+        return contact.model_copy(update={"metadata": metadata})

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from sales_agent.domain.models import CRMContact
+from sales_agent.services.name_validation import contact_has_reliable_name
 
 
 class LeadScopedCRMTools:
@@ -103,4 +104,9 @@ class LeadScopedCRMTools:
         local_metadata = dict(self.current_lead.metadata or {})
         refreshed_metadata = dict(refreshed.metadata or {})
         merged_metadata = {**refreshed_metadata, **local_metadata}
-        return refreshed.model_copy(update={"metadata": merged_metadata})
+        resolved_name = refreshed.full_name
+        if contact_has_reliable_name(self.current_lead):
+            resolved_name = self.current_lead.full_name
+        elif not resolved_name:
+            resolved_name = self.current_lead.full_name
+        return refreshed.model_copy(update={"full_name": resolved_name, "metadata": merged_metadata})

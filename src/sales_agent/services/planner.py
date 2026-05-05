@@ -19,8 +19,10 @@ from sales_agent.services.name_validation import (
     apply_name_validation_metadata,
     build_trusted_name_assessment,
     contact_has_reliable_name,
+    get_effective_contact_name,
     get_name_confirmation_candidate,
     is_specific_person_name,
+    normalize_person_name,
 )
 from sales_agent.services.prompt_library import PromptLibrary, PromptSection
 
@@ -81,6 +83,23 @@ class AgentPlanner:
         "Perdido": -1,
         "No califica": -1,
     }
+    _NON_NAME_MESSAGE_TOKENS = {
+        "agendala",
+        "agendarla",
+        "cuanto",
+        "como",
+        "correo",
+        "demo",
+        "esa",
+        "ese",
+        "esto",
+        "mi",
+        "nombre",
+        "quiero",
+        "vale",
+        "wabog",
+        "y",
+    }
 
     def __init__(self, settings: Settings, prompt_library: PromptLibrary | None = None) -> None:
         self._settings = settings
@@ -113,8 +132,19 @@ class AgentPlanner:
         semantic_memories: list[str],
     ) -> PlanningResult:
         semantic_guardrail = await self._resolve_semantic_guardrails(text, contact, recent_messages)
-        if semantic_guardrail.special_case_intent != "none":
-            return self._build_special_case_result(semantic_guardrail, contact)
+        explicit_name = self._extract_explicit_name(text)
+        if semantic_guardrail.special_case_intent != "none" and explicit_name is None:
+            result = self._build_special_case_result(semantic_guardrail, contact)
+            name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
+            repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
+            return self._apply_planning_guardrail(
+                repaired,
+                text,
+                contact,
+                recent_messages,
+                name_confirmation,
+                semantic_guardrail,
+            )
         if self._llm is not None:
             try:
                 selection = await self._select_knowledge_sections(text, contact, recent_messages)
@@ -222,17 +252,32 @@ class AgentPlanner:
         metadata = dict(contact.metadata or {})
         calendar = dict((metadata.get("calendar") or {}))
         name_validation = dict((metadata.get("name_validation") or {}))
+        effective_name = get_effective_contact_name(contact)
+        candidate_name = get_name_confirmation_candidate(contact)
+        provider_name = (metadata.get("provider_name") or "").strip() or None
         rendered = {
             "external_id": contact.external_id,
             "phone_number": contact.phone_number,
-            "full_name": contact.full_name,
+            "full_name": effective_name,
             "stage": contact.stage,
             "email": contact.email,
             "followup_summary": contact.followup_summary,
             "followup_due_date": contact.followup_due_date.isoformat() if contact.followup_due_date else None,
             "recent_notes": contact.notes[-self._settings.crm_notes_context_limit :],
+            "live_context": {
+                "effective_name": effective_name,
+                "candidate_name": None if effective_name else candidate_name,
+                "provider_name_hint": None if effective_name else provider_name,
+            },
             "metadata": {
-                "name_validation": name_validation or None,
+                "name_validation": {
+                    "status": name_validation.get("status"),
+                    "confidence": name_validation.get("confidence"),
+                    "source": name_validation.get("source"),
+                    "candidate_name": None if effective_name else candidate_name,
+                }
+                if name_validation
+                else None,
                 "calendar": {
                     "connected": calendar.get("connected"),
                     "available": calendar.get("available"),
@@ -360,7 +405,7 @@ class AgentPlanner:
         contact: CRMContact | None,
     ) -> PlanningResult:
         if decision.special_case_intent == "ask_name":
-            full_name = (contact.full_name or "").strip() if contact else ""
+            full_name = get_effective_contact_name(contact) or ""
             candidate_name = get_name_confirmation_candidate(contact)
             if contact_has_reliable_name(contact):
                 response_text = f"Te tengo registrado como {full_name}."
@@ -433,6 +478,8 @@ class AgentPlanner:
                     for key, value in normalized_fields.items()
                     if key in {"email", "full_name"} and str(value).strip()
                 }
+                if not args["fields"]:
+                    continue
                 for key in tuple(explicit_contact_fields):
                     if args["fields"].get(key):
                         explicit_contact_fields.pop(key, None)
@@ -555,6 +602,11 @@ class AgentPlanner:
         if (
             inferred_stage
             and semantic_guardrail.stage_confidence >= 0.7
+            and (
+                inferred_stage != "Demo agendada"
+                or upcoming_event is not None
+                or any(action.type == ActionType.CREATE_MEETING for action in actions)
+            )
             and self._should_update_stage(contact.stage if contact and contact.stage else "Prospecto", inferred_stage)
             and not any(action.type == ActionType.UPDATE_STAGE for action in actions)
         ):
@@ -809,6 +861,13 @@ class AgentPlanner:
     ) -> dict[str, str | int] | None:
         start_at = self._extract_requested_meeting_start(text, recent_messages)
         if start_at is None:
+            pending_start_iso = str((((contact.metadata if contact else {}) or {}).get("live_context") or {}).get("pending_booking_start_iso") or "").strip()
+            if pending_start_iso:
+                try:
+                    start_at = datetime.fromisoformat(pending_start_iso)
+                except ValueError:
+                    start_at = None
+        if start_at is None:
             return None
         lead_label = (contact.full_name or "Lead").strip() if contact and contact_has_reliable_name(contact) else "Lead"
         description_parts = [
@@ -1013,6 +1072,17 @@ class AgentPlanner:
             if len(parts) > 5:
                 return None
             return " ".join(part.capitalize() for part in parts)
+        normalized = normalize_person_name(text)
+        normalized_lookup = self._normalize_lookup_text(text)
+        lookup_tokens = [token for token in normalized_lookup.split() if token]
+        if (
+            normalized
+            and is_specific_person_name(normalized)
+            and 2 <= len(normalized.split()) <= 5
+            and lookup_tokens
+            and not any(token in self._NON_NAME_MESSAGE_TOKENS for token in lookup_tokens)
+        ):
+            return normalized
         return None
 
     def _build_followup_completion_outcome(self, text: str, upcoming_event: dict | None = None) -> str:
@@ -1070,9 +1140,6 @@ class AgentPlanner:
         current_text = text.strip()
         lowered_text = current_text.lower()
         lowered_context_messages = [message.lower() for message in context_messages]
-        combined_lowered = " ".join(lowered_context_messages + [lowered_text]).strip()
-        if not any(token in combined_lowered for token in ("demo", "agendar", "reunión", "reunion", "llamada", "presentación", "presentacion")):
-            return None
         tz = ZoneInfo(self._settings.google_calendar_timezone)
         base_date = datetime.now(tz).date()
 

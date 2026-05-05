@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sales_agent.domain.models import CRMContact
+from sales_agent.services.name_validation import contact_has_reliable_name
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -14,9 +15,15 @@ def merge_contact_with_shadow(contact: CRMContact, shadow: CRMContact | None) ->
     if shadow is None:
         return contact
     merged_metadata = {**(shadow.metadata or {}), **(contact.metadata or {})}
+    if contact_has_reliable_name(shadow):
+        resolved_name = shadow.full_name
+    elif contact_has_reliable_name(contact):
+        resolved_name = contact.full_name
+    else:
+        resolved_name = contact.full_name or shadow.full_name
     return contact.model_copy(
         update={
-            "full_name": contact.full_name or shadow.full_name,
+            "full_name": resolved_name,
             "stage": contact.stage or shadow.stage,
             "email": contact.email or shadow.email,
             "notes": contact.notes or shadow.notes,
@@ -54,6 +61,9 @@ async def enrich_contact_with_calendar(contact: CRMContact, calendar_adapter, se
 
     previous_event_id = ((previous_calendar.get("upcoming_event") or {}).get("id"))
     current_event_id = (upcoming_event or {}).get("id")
+    if upcoming_event is None and previous_calendar.get("upcoming_event"):
+        upcoming_event = previous_calendar.get("upcoming_event")
+        current_event_id = (upcoming_event or {}).get("id")
     calendar_state["available"] = True
     calendar_state["upcoming_event"] = upcoming_event
     calendar_state["just_booked"] = bool(current_event_id and current_event_id != previous_event_id)
