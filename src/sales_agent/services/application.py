@@ -298,6 +298,9 @@ class SalesAgentApplication:
                         )
                         current_lead = scoped_tools.current_lead
                         current_lead = await self._sync_crm_after_meeting_created(scoped_tools, current_lead, payload)
+                    elif action.type == ActionType.DELETE_MEETING and scoped_tools is not None:
+                        payload = await scoped_tools.delete_meeting(event_id=action.args["event_id"])
+                        current_lead = scoped_tools.current_lead
                     elif action.type == ActionType.HANDOFF_HUMAN:
                         payload = {"status": "requested"}
                     else:

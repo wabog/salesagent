@@ -16,22 +16,32 @@ from sales_agent.services.application import PreparedBatchRun, SalesAgentApplica
 
 
 class _StubCalendarAdapter:
+    def __init__(self) -> None:
+        self.deleted_event_ids: list[str] = []
+        self.created_event_ids: list[str] = []
+
     async def find_upcoming_meeting(self, contact):  # noqa: ANN001
         return None
 
     async def create_meeting(self, contact, *, start_iso, duration_minutes, title, description):  # noqa: ANN001
+        event_id = f"evt-{len(self.created_event_ids) + 1}"
+        self.created_event_ids.append(event_id)
         return {
-            "id": "evt-1",
+            "id": event_id,
             "summary": title,
             "description": description,
             "start_iso": start_iso,
             "end_iso": start_iso,
-            "html_link": "https://calendar.google.com/event?eid=evt-1",
+            "html_link": f"https://calendar.google.com/event?eid={event_id}",
             "meet_link": "https://meet.google.com/test-meet",
             "status": "confirmed",
             "attendees": [contact.email] if contact.email else [],
             "source": "agent_created",
         }
+
+    async def delete_meeting(self, event_id):  # noqa: ANN001
+        self.deleted_event_ids.append(event_id)
+        return {"id": event_id, "status": "cancelled", "source": "agent_deleted"}
 
 
 class _CapturingChannelAdapter:
@@ -156,6 +166,83 @@ async def test_commit_batched_run_syncs_crm_after_meeting_creation():
 
 
 @pytest.mark.asyncio
+async def test_commit_batched_run_recreates_meeting_and_deletes_previous_event():
+    app = build_application()
+    stub_calendar = _StubCalendarAdapter()
+    app.calendar_adapter = stub_calendar
+    await app.startup()
+    try:
+        created = await app.crm_adapter.create_contact("573001111223", "Paula Diaz")
+        current_lead = await app.crm_adapter.update_contact_fields(
+            created.external_id,
+            {"email": "paula@example.com"},
+        )
+        current_lead = current_lead.model_copy(
+            update={
+                "stage": "Demo agendada",
+                "metadata": {
+                    "name_validation": {"status": "trusted", "source": "user_message"},
+                    "calendar": {
+                        "connected": True,
+                        "upcoming_event": {
+                            "id": "evt-old",
+                            "start_iso": "2026-05-02T10:00:00-05:00",
+                        },
+                    },
+                },
+            }
+        )
+        event = InboundMessage(
+            message_id="meeting-app-2",
+            conversation_id="conv-app-meeting-2",
+            phone_number="573001111223",
+            text="mañana a las 11 am me sirve",
+            timestamp=datetime.now(timezone.utc),
+            raw_payload={},
+            provider="local-playground",
+        )
+        prepared = PreparedBatchRun(
+            run_id="run-meeting-app-2",
+            events=[event],
+            current_lead=current_lead,
+            lead_created=False,
+            recent_messages=[],
+            response_text="Voy a mover la demo.",
+            planning=PlanningResult(
+                intent="reschedule_demo",
+                confidence=0.92,
+                response_text="Voy a mover la demo.",
+                actions=[
+                    ProposedAction(
+                        type=ActionType.CREATE_MEETING,
+                        reason="Mover al nuevo horario.",
+                        args={
+                            "start_iso": "2026-05-02T11:00:00-05:00",
+                            "duration_minutes": 30,
+                            "title": "Demo Wabog - Paula Diaz",
+                            "description": "Demo comercial creada por el agente de ventas de Wabog.",
+                        },
+                    ),
+                    ProposedAction(
+                        type=ActionType.DELETE_MEETING,
+                        reason="Eliminar el evento anterior.",
+                        args={"event_id": "evt-old"},
+                    ),
+                ],
+            ),
+        )
+
+        result = await app.commit_batched_run(prepared)
+    finally:
+        await app.shutdown()
+
+    assert stub_calendar.deleted_event_ids == ["evt-old"]
+    assert any(item.action.type == ActionType.CREATE_MEETING and item.success for item in result.tool_results)
+    assert any(item.action.type == ActionType.DELETE_MEETING and item.success for item in result.tool_results)
+    assert "2026-05-02T11:00:00-05:00" in result.response_text
+
+
+@pytest.mark.asyncio
 async def test_handle_event_e2e_confirms_candidate_name_by_context_and_books_demo():
     app = build_application()
     app.calendar_adapter = _StubCalendarAdapter()
@@ -268,3 +355,147 @@ async def test_handle_event_e2e_confirms_candidate_name_by_context_and_books_dem
     assert second.contact is not None
     assert second.contact.full_name == "Fabian C Villegas"
     assert second.contact.stage == "Demo agendada"
+
+
+@pytest.mark.asyncio
+async def test_handle_event_e2e_prod_conversation_books_and_reprograms_without_name_pollution():
+    app = build_application()
+    stub_calendar = _StubCalendarAdapter()
+    app.calendar_adapter = stub_calendar
+    app.channel_adapter = _CapturingChannelAdapter()
+    await app.startup()
+    try:
+        created = await app.crm_adapter.create_contact("573156832405", "Lead Inicial")
+        current = await app.crm_adapter.find_contact_by_phone("573156832405")
+        assert current is not None
+        shadow = apply_name_validation_metadata(
+            current,
+            NameCandidateAssessment(
+                status="needs_confirmation",
+                confidence=0.95,
+                normalized_name="Fabian C Villegas",
+                candidate_name="Fabian C Villegas",
+                source="provider_llm",
+            ),
+        )
+        await app.memory_store.remember_contact(shadow)
+
+        async def fake_resolve(text, contact, recent_messages):  # noqa: ANN001
+            if text == "Fabian Cuero\nfabiancuerov@gmail.com":
+                return NameConfirmationDecision(
+                    status="provided_new_name",
+                    confidence=0.99,
+                    resolved_name="Fabian Cuero",
+                )
+            return None
+
+        def fake_plan_with_rules(text, contact):  # noqa: ANN001
+            if text == "Hola":
+                return PlanningResult(
+                    intent="greeting",
+                    confidence=0.8,
+                    response_text="Hola, ¿en qué puedo ayudarte hoy con Wabog?",
+                    actions=[],
+                )
+            if text == "Llevo 300 casos al mes y hago el seguimiento manualmente entrando a la rama y los llevo en un excel los casos.":
+                return PlanningResult(
+                    intent="qualification",
+                    confidence=0.84,
+                    response_text="Con ese volumen, Wabog puede ayudarte a automatizar el seguimiento. ¿Quieres que agendemos una demo?",
+                    actions=[],
+                )
+            if text == "Cuánto cuesta ?":
+                return PlanningResult(
+                    intent="pricing",
+                    confidence=0.85,
+                    response_text="Para ese volumen, lo ideal es revisar Enterprise en una demo.",
+                    actions=[],
+                )
+            if text == "Si agéndala":
+                return PlanningResult(
+                    intent="schedule_interest",
+                    confidence=0.9,
+                    response_text="Perfecto. Para enviarte la invitación, compárteme también tu correo.",
+                    actions=[],
+                )
+            if text == "Fabian Cuero\nfabiancuerov@gmail.com":
+                return PlanningResult(
+                    intent="collect_contact_data",
+                    confidence=0.92,
+                    response_text="Perfecto. Ya tengo tus datos. ¿Qué día y hora te sirve para la demo?",
+                    actions=[],
+                )
+            if text == "Mañana a las 10am":
+                return PlanningResult(
+                    intent="schedule_demo",
+                    confidence=0.93,
+                    response_text="Perfecto, reviso ese horario.",
+                    actions=[],
+                )
+            if text == "Ya no puedo a las 10 am mañana podemos re programar a las 11 am ?":
+                return PlanningResult(
+                    intent="reschedule_demo",
+                    confidence=0.94,
+                    response_text="Perfecto, voy a mover la demo al nuevo horario.",
+                    actions=[],
+                )
+            raise AssertionError(f"Unexpected text in test: {text}")
+
+        app.workflow.planner._name_confirmation_resolver.resolve = fake_resolve  # noqa: SLF001
+        app.workflow.planner._plan_with_rules = fake_plan_with_rules  # noqa: SLF001
+
+        turns = [
+            ("prod-sim-1", "Hola"),
+            ("prod-sim-2", "Llevo 300 casos al mes y hago el seguimiento manualmente entrando a la rama y los llevo en un excel los casos."),
+            ("prod-sim-3", "Cuánto cuesta ?"),
+            ("prod-sim-4", "Si agéndala"),
+            ("prod-sim-5", "Fabian Cuero\nfabiancuerov@gmail.com"),
+            ("prod-sim-6", "Mañana a las 10am"),
+            ("prod-sim-7", "Ya no puedo a las 10 am mañana podemos re programar a las 11 am ?"),
+        ]
+        results = []
+        for message_id, text in turns:
+            results.append(
+                await app.handle_event(
+                    InboundMessage(
+                        message_id=message_id,
+                        conversation_id="conv-prod-sim",
+                        phone_number="573156832405",
+                        text=text,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_payload={},
+                        provider="local-playground",
+                    ),
+                    wait_for_response=True,
+                )
+            )
+    finally:
+        await app.shutdown()
+
+    pending_name_reply = results[0].response_text
+    assert "tu nombre es fabian c villegas" in pending_name_reply.lower()
+
+    contact_after_name = results[4].contact
+    assert contact_after_name is not None
+    assert contact_after_name.full_name == "Fabian Cuero"
+    assert contact_after_name.email == "fabiancuerov@gmail.com"
+
+    booking_result = results[5]
+    assert any(item.action.type == ActionType.CREATE_MEETING and item.success for item in booking_result.tool_results)
+    first_event_id = next(
+        item.payload["id"]
+        for item in booking_result.tool_results
+        if item.action.type == ActionType.CREATE_MEETING and item.success
+    )
+    assert booking_result.contact is not None
+    assert booking_result.contact.full_name == "Fabian Cuero"
+    assert booking_result.contact.metadata["name_validation"]["normalized_name"] == "Fabian Cuero"
+
+    reschedule_result = results[6]
+    assert any(item.action.type == ActionType.CREATE_MEETING and item.success for item in reschedule_result.tool_results)
+    assert any(item.action.type == ActionType.DELETE_MEETING and item.success for item in reschedule_result.tool_results)
+    assert first_event_id in stub_calendar.deleted_event_ids
+    assert "11:00:00-05:00" in reschedule_result.response_text
+    assert reschedule_result.contact is not None
+    assert reschedule_result.contact.full_name == "Fabian Cuero"
+    assert reschedule_result.contact.metadata["calendar"]["upcoming_event"]["start_iso"].endswith("11:00:00-05:00")

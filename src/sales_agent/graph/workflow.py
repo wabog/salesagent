@@ -236,6 +236,9 @@ class SalesAgentWorkflow:
                         description=action.args["description"],
                     )
                     current_lead = scoped_tools.current_lead
+                elif action.type == ActionType.DELETE_MEETING:
+                    payload = await scoped_tools.delete_meeting(event_id=action.args["event_id"])
+                    current_lead = scoped_tools.current_lead
                 elif action.type == ActionType.HANDOFF_HUMAN:
                     state["handoff_requested"] = True
                     payload = {"status": "requested"}

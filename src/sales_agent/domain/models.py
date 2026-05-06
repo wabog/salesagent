@@ -28,6 +28,7 @@ class ActionType(StrEnum):
     CREATE_FOLLOWUP = "create_followup"
     COMPLETE_FOLLOWUP = "complete_followup"
     CREATE_MEETING = "create_meeting"
+    DELETE_MEETING = "delete_meeting"
     HANDOFF_HUMAN = "handoff_human"
 
 

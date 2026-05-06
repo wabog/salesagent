@@ -10,6 +10,7 @@ from sales_agent.core.db import build_engine, build_session_factory, init_db
 from sales_agent.domain.models import CRMContact, InboundMessage
 from sales_agent.domain.models import ActionType, PlanningResult, ProposedAction
 from sales_agent.graph.workflow import SalesAgentWorkflow
+from sales_agent.services.name_validation import NameConfirmationDecision
 from sales_agent.services.planner import AgentPlanner
 from sales_agent.services.policy import ToolExecutionPolicy
 
@@ -156,14 +157,23 @@ async def test_workflow_updates_contact_fields_from_explicit_user_data():
     workflow, crm, _ = await build_workflow()
     existing = await crm.create_contact("573001119900", "Lead Inicial")
 
+    async def fake_resolve(text, contact, recent_messages):  # noqa: ANN001
+        return NameConfirmationDecision(
+            status="provided_new_name",
+            confidence=0.99,
+            resolved_name="Juan Perez",
+        )
+
     event = InboundMessage(
         message_id="contact-update-1",
         conversation_id="conv-contact-update",
         phone_number="573001119900",
-        text="mi nombre es juan perez y mi correo es juan@example.com",
+        text="juan@example.com",
         timestamp=datetime.now(timezone.utc),
         raw_payload={},
     )
+
+    workflow.planner._resolve_name_confirmation = fake_resolve  # noqa: SLF001
 
     result = await workflow.run(event)
     contact = await crm.find_contact_by_phone("+573001119900")

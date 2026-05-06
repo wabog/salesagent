@@ -74,6 +74,17 @@ class GoogleCalendarAdapter:
             payload = response.json()
         return self._normalize_event(payload, source="agent_created")
 
+    async def delete_meeting(self, event_id: str) -> dict[str, Any]:
+        access_token = await self._refresh_access_token()
+        async with httpx.AsyncClient(base_url=self._base_url, timeout=30.0) as client:
+            response = await client.delete(
+                f"/calendars/{self._settings.google_calendar_id}/events/{event_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"sendUpdates": "all"},
+            )
+            response.raise_for_status()
+        return {"id": event_id, "status": "cancelled", "source": "agent_deleted"}
+
     async def find_upcoming_meeting(self, contact: CRMContact, *, lookahead_days: int = 45) -> dict[str, Any] | None:
         if not contact.email and not contact.full_name:
             return None

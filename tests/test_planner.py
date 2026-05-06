@@ -301,9 +301,14 @@ def test_repair_actions_appends_explicit_contact_fields_even_when_llm_omits_upda
 
     repaired = planner._repair_actions(  # noqa: SLF001
         result,
-        "mi nombre es Prueba Calendar QA y mi correo es prueba.calendar.qa@example.com",
+        "prueba.calendar.qa@example.com",
         None,
         [],
+        NameConfirmationDecision(
+            status="provided_new_name",
+            confidence=0.98,
+            resolved_name="Prueba Calendar Qa",
+        ),
     )
 
     update_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
@@ -313,7 +318,7 @@ def test_repair_actions_appends_explicit_contact_fields_even_when_llm_omits_upda
     }
 
 
-def test_repair_actions_extracts_standalone_full_name_message():
+def test_repair_actions_uses_contextual_resolver_for_standalone_full_name_message():
     planner = build_planner()
     result = PlanningResult(
         intent="name_correction",
@@ -327,6 +332,118 @@ def test_repair_actions_extracts_standalone_full_name_message():
         "Fabian Cuero Villegas",
         None,
         ["Tu nombre actual figura como Juan Perez. Si quieres, compárteme tu nombre completo correcto."],
+        NameConfirmationDecision(
+            status="provided_new_name",
+            confidence=0.99,
+            resolved_name="Fabian Cuero Villegas",
+        ),
+    )
+
+    update_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
+    assert update_action.args["fields"] == {"full_name": "Fabian Cuero Villegas"}
+
+
+def test_planning_guardrail_recreates_existing_meeting_when_new_time_is_requested():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        stage="Demo agendada",
+        metadata={
+            "name_validation": {"status": "trusted", "source": "user_message"},
+            "calendar": {
+                "connected": True,
+                "upcoming_event": {
+                    "id": "evt-old",
+                    "start_iso": "2026-05-07T10:00:00-05:00",
+                },
+            },
+        },
+    )
+    result = PlanningResult(
+        intent="reprogram_demo",
+        confidence=0.87,
+        response_text="Voy a revisar la reprogramación.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "mañana a las 11 am",
+        contact,
+        ["La demo quedó agendada para mañana a las 10 am."],
+    )
+
+    assert [action.type for action in guarded.actions] == [
+        ActionType.CREATE_MEETING,
+        ActionType.DELETE_MEETING,
+    ]
+    assert guarded.actions[0].args["start_iso"].endswith("11:00:00-05:00")
+    assert guarded.actions[1].args["event_id"] == "evt-old"
+
+
+def test_planning_guardrail_keeps_asking_for_name_while_confirmation_is_pending():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Inicial",
+        email="lead@example.com",
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Fabian C Villegas",
+                "normalized_name": "Fabian C Villegas",
+                "source": "provider_llm",
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="consult_price",
+        confidence=0.8,
+        response_text="El plan Enterprise se revisa con ventas según volumen.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "¿cuánto cuesta?",
+        contact,
+        ["Perfecto, avanzamos con la demo."],
+    )
+
+    assert "tu nombre es fabian c villegas" in guarded.response_text.lower()
+    assert "compárteme tu nombre completo" in guarded.response_text.lower()
+
+
+def test_repair_actions_allows_replacing_a_previously_confirmed_name():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        metadata={"name_validation": {"status": "trusted", "source": "user_message"}},
+    )
+    result = PlanningResult(
+        intent="name_correction",
+        confidence=0.84,
+        response_text="Gracias por la aclaración.",
+        actions=[],
+    )
+
+    repaired = planner._repair_actions(  # noqa: SLF001
+        result,
+        "Mi apellido completo también es Villegas",
+        contact,
+        ["Tu nombre actual es Fabian Cuero."],
+        NameConfirmationDecision(
+            status="provided_new_name",
+            confidence=0.99,
+            resolved_name="Fabian Cuero Villegas",
+        ),
     )
 
     update_action = next(action for action in repaired.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
@@ -666,17 +783,16 @@ def test_plan_with_rules_does_not_append_self_schedule_link_from_demo_keywords()
     assert "calendar.app.google" not in planned.response_text
 
 
-def test_plan_with_rules_creates_contact_update_action_for_email_and_name():
+def test_plan_with_rules_creates_contact_update_action_for_email_only():
     planner = build_planner()
 
     result = planner._plan_with_rules(  # noqa: SLF001
-        "Hola, mi nombre es juan perez y mi correo es juan@example.com",
+        "Hola, mi correo es juan@example.com",
         None,
     )
 
     update_action = next(action for action in result.actions if action.type == ActionType.UPDATE_CONTACT_FIELDS)
     assert update_action.args["fields"] == {
-        "full_name": "Juan Perez",
         "email": "juan@example.com",
     }
     assert "correo" in result.response_text.lower()

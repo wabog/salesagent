@@ -100,6 +100,20 @@ class LeadScopedCRMTools:
         self.current_lead = self.current_lead.model_copy(update={"metadata": metadata})
         return payload
 
+    async def delete_meeting(self, *, event_id: str) -> dict:
+        if self.calendar is None:
+            raise ValueError("Calendar integration is not configured.")
+        payload = await self.calendar.delete_meeting(event_id)
+        metadata = dict(self.current_lead.metadata or {})
+        calendar_state = dict((metadata.get("calendar") or {}))
+        upcoming_event = calendar_state.get("upcoming_event") or {}
+        if upcoming_event.get("id") == event_id:
+            calendar_state["upcoming_event"] = None
+            calendar_state["just_booked"] = False
+        metadata["calendar"] = calendar_state
+        self.current_lead = self.current_lead.model_copy(update={"metadata": metadata})
+        return payload
+
     def _merge_local_metadata(self, refreshed: CRMContact) -> CRMContact:
         local_metadata = dict(self.current_lead.metadata or {})
         refreshed_metadata = dict(refreshed.metadata or {})

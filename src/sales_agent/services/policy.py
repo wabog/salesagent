@@ -47,3 +47,7 @@ class ToolExecutionPolicy:
             duration_minutes = int(action.args.get("duration_minutes", 0) or 0)
             if duration_minutes <= 0:
                 raise ValueError("Meeting creation requires a positive duration_minutes.")
+        if action.type == ActionType.DELETE_MEETING:
+            event_id = str(action.args.get("event_id", "")).strip()
+            if not event_id:
+                raise ValueError("Meeting deletion requires event_id.")

@@ -22,7 +22,6 @@ from sales_agent.services.name_validation import (
     get_effective_contact_name,
     get_name_confirmation_candidate,
     is_specific_person_name,
-    normalize_person_name,
 )
 from sales_agent.services.prompt_library import PromptLibrary, PromptSection
 
@@ -83,23 +82,6 @@ class AgentPlanner:
         "Perdido": -1,
         "No califica": -1,
     }
-    _NON_NAME_MESSAGE_TOKENS = {
-        "agendala",
-        "agendarla",
-        "cuanto",
-        "como",
-        "correo",
-        "demo",
-        "esa",
-        "ese",
-        "esto",
-        "mi",
-        "nombre",
-        "quiero",
-        "vale",
-        "wabog",
-        "y",
-    }
 
     def __init__(self, settings: Settings, prompt_library: PromptLibrary | None = None) -> None:
         self._settings = settings
@@ -132,10 +114,16 @@ class AgentPlanner:
         semantic_memories: list[str],
     ) -> PlanningResult:
         semantic_guardrail = await self._resolve_semantic_guardrails(text, contact, recent_messages)
-        explicit_name = self._extract_explicit_name(text)
-        if semantic_guardrail.special_case_intent != "none" and explicit_name is None:
+        name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
+        if (
+            semantic_guardrail.special_case_intent != "none"
+            and not (
+                name_confirmation is not None
+                and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+                and name_confirmation.resolved_name
+            )
+        ):
             result = self._build_special_case_result(semantic_guardrail, contact)
-            name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
             repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
             return self._apply_planning_guardrail(
                 repaired,
@@ -168,7 +156,6 @@ class AgentPlanner:
                             ]
                         }
                     )
-                name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
                 repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
                 return self._apply_planning_guardrail(
                     repaired,
@@ -181,7 +168,6 @@ class AgentPlanner:
             except OpenAIError:
                 return self._plan_with_rules(text, contact)
         result = self._plan_with_rules(text, contact)
-        name_confirmation = await self._resolve_name_confirmation(text, contact, recent_messages)
         repaired = self._repair_actions(result, text, contact, recent_messages, name_confirmation)
         return self._apply_planning_guardrail(
             repaired,
@@ -451,11 +437,8 @@ class AgentPlanner:
         contextual_name_applied = False
         explicit_contact_fields: dict[str, str] = {}
         inferred_email = self._extract_email(text)
-        inferred_name = self._extract_explicit_name(text)
         if inferred_email and (contact is None or (contact.email or "").strip() != inferred_email):
             explicit_contact_fields["email"] = inferred_email
-        if inferred_name and (contact is None or (contact.full_name or "").strip() != inferred_name):
-            explicit_contact_fields["full_name"] = inferred_name
         for action in result.actions:
             args = dict(action.args)
             if action.type == ActionType.UPDATE_CONTACT_FIELDS:
@@ -463,8 +446,6 @@ class AgentPlanner:
                 normalized_fields = dict(fields) if isinstance(fields, dict) else {}
                 if inferred_email and not normalized_fields.get("email"):
                     normalized_fields["email"] = inferred_email
-                if inferred_name and not normalized_fields.get("full_name"):
-                    normalized_fields["full_name"] = inferred_name
                 if (
                     name_confirmation is not None
                     and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
@@ -501,18 +482,15 @@ class AgentPlanner:
             and not contextual_name_applied
             and (contact is None or (contact.full_name or "").strip() != name_confirmation.resolved_name)
         ):
-            repaired_actions.append(
-                ProposedAction(
-                    type=ActionType.UPDATE_CONTACT_FIELDS,
-                    reason="Validador contextual confirmó el nombre del lead.",
-                    args={"fields": {"full_name": name_confirmation.resolved_name}},
-                )
-            )
+            explicit_contact_fields.setdefault("full_name", name_confirmation.resolved_name)
         if explicit_contact_fields:
             repaired_actions.append(
                 ProposedAction(
                     type=ActionType.UPDATE_CONTACT_FIELDS,
-                    reason="El mensaje contiene datos de contacto explícitos que deben persistirse aunque el modelo no haya emitido la acción.",
+                    reason=(
+                        "El turno actual dejó datos de contacto confiables que deben persistirse "
+                        "aunque el modelo no haya emitido la acción."
+                    ),
                     args={"fields": explicit_contact_fields},
                 )
             )
@@ -541,6 +519,7 @@ class AgentPlanner:
         meeting_payload = self._build_meeting_payload(text, projected_contact, recent_messages)
         missing_meeting_fields = self._missing_contact_fields_for_meeting(projected_contact)
         upcoming_event = self._get_upcoming_calendar_event(contact)
+        requested_reschedule = self._meeting_start_changed(upcoming_event, meeting_payload)
 
         response_text = result.response_text
         normalized_actions: list[ProposedAction] = []
@@ -594,7 +573,40 @@ class AgentPlanner:
                 )
             )
 
-        if upcoming_event is None and not any(action.type == ActionType.CREATE_MEETING for action in actions):
+        if (
+            requested_reschedule
+            and meeting_payload is not None
+            and not missing_meeting_fields
+            and not any(action.type == ActionType.CREATE_MEETING for action in actions)
+            and self._current_turn_can_finish_booking(text, name_confirmation)
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.CREATE_MEETING,
+                    reason="El lead pidió mover una demo ya agendada a un nuevo horario concreto.",
+                    args=dict(meeting_payload),
+                )
+            )
+
+        if (
+            requested_reschedule
+            and upcoming_event is not None
+            and upcoming_event.get("id")
+            and any(action.type == ActionType.CREATE_MEETING for action in actions)
+            and not any(
+                action.type == ActionType.DELETE_MEETING and action.args.get("event_id") == upcoming_event.get("id")
+                for action in actions
+            )
+        ):
+            actions.append(
+                ProposedAction(
+                    type=ActionType.DELETE_MEETING,
+                    reason="La demo anterior debe eliminarse después de recrearla en el nuevo horario.",
+                    args={"event_id": upcoming_event["id"]},
+                )
+            )
+
+        if not any(action.type == ActionType.CREATE_MEETING for action in actions):
             response_text = self._strip_false_booking_claims(response_text)
 
         semantic_guardrail = semantic_guardrail or SemanticGuardrailDecision()
@@ -650,6 +662,7 @@ class AgentPlanner:
             response_text = self._build_trial_response(response_text)
         else:
             response_text = self._normalize_wabog_urls(response_text)
+        response_text = self._ensure_pending_name_prompt(response_text, contact, name_confirmation)
 
         return result.model_copy(update={"actions": actions, "response_text": response_text})
 
@@ -673,8 +686,6 @@ class AgentPlanner:
         ) and re.search(r"\b\d{1,2}(?::\d{2})?\s*(am|pm)?\b", lowered):
             return True
         if self._extract_email(text) is not None:
-            return True
-        if self._extract_explicit_name(text) is not None:
             return True
         return bool(
             name_confirmation is not None
@@ -732,15 +743,8 @@ class AgentPlanner:
             return None
         projected = contact.model_copy(deep=True)
         explicit_email = self._extract_email(text)
-        explicit_name = self._extract_explicit_name(text)
         if explicit_email:
             projected.email = explicit_email
-        if explicit_name:
-            projected.full_name = explicit_name
-            projected = apply_name_validation_metadata(
-                projected,
-                build_trusted_name_assessment(explicit_name, source="user_message"),
-            )
         for action in actions:
             if action.type != ActionType.UPDATE_CONTACT_FIELDS:
                 continue
@@ -991,14 +995,10 @@ class AgentPlanner:
             confidence = max(confidence, 0.82)
 
         explicit_email = self._extract_email(text)
-        explicit_name = self._extract_explicit_name(text)
         contact_fields: dict[str, str] = {}
         current_email = (contact.email or "").strip() if contact else ""
-        current_name = (contact.full_name or "").strip() if contact else ""
         if explicit_email and explicit_email != current_email:
             contact_fields["email"] = explicit_email
-        if explicit_name and explicit_name != current_name:
-            contact_fields["full_name"] = explicit_name
         if contact_fields:
             actions.append(
                 ProposedAction(
@@ -1056,35 +1056,6 @@ class AgentPlanner:
             return None
         return match.group(1).strip().lower()
 
-    def _extract_explicit_name(self, text: str) -> str | None:
-        patterns = (
-            r"\bmi nombre es\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ' -]{1,60}?)(?=\s+(?:y\s+(?:mi\s+)?correo)\b|[,.!?]|\n|$)",
-            r"\bme llamo\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ' -]{1,60}?)(?=\s+(?:y\s+(?:mi\s+)?correo)\b|[,.!?]|\n|$)",
-        )
-        for pattern in patterns:
-            if not (match := re.search(pattern, text, re.IGNORECASE)):
-                continue
-            candidate = re.split(r"[,.!?\n]", match.group(1).strip(), maxsplit=1)[0].strip(" -")
-            candidate = re.sub(r"\s+", " ", candidate)
-            if not candidate:
-                return None
-            parts = candidate.split(" ")
-            if len(parts) > 5:
-                return None
-            return " ".join(part.capitalize() for part in parts)
-        normalized = normalize_person_name(text)
-        normalized_lookup = self._normalize_lookup_text(text)
-        lookup_tokens = [token for token in normalized_lookup.split() if token]
-        if (
-            normalized
-            and is_specific_person_name(normalized)
-            and 2 <= len(normalized.split()) <= 5
-            and lookup_tokens
-            and not any(token in self._NON_NAME_MESSAGE_TOKENS for token in lookup_tokens)
-        ):
-            return normalized
-        return None
-
     def _build_followup_completion_outcome(self, text: str, upcoming_event: dict | None = None) -> str:
         if upcoming_event is not None:
             return f"El lead ya tiene una demo agendada para {upcoming_event.get('start_iso')}."
@@ -1099,6 +1070,47 @@ class AgentPlanner:
         if contact is None:
             return None
         return ((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")
+
+    def _meeting_start_changed(self, upcoming_event: dict | None, meeting_payload: dict | None) -> bool:
+        if not upcoming_event or not meeting_payload:
+            return False
+        current_start = str(upcoming_event.get("start_iso") or "").strip()
+        requested_start = str(meeting_payload.get("start_iso") or "").strip()
+        if not current_start or not requested_start:
+            return False
+        try:
+            return datetime.fromisoformat(current_start) != datetime.fromisoformat(requested_start)
+        except ValueError:
+            return current_start != requested_start
+
+    def _ensure_pending_name_prompt(
+        self,
+        response_text: str,
+        contact: CRMContact | None,
+        name_confirmation: NameConfirmationDecision | None,
+    ) -> str:
+        candidate_name = get_name_confirmation_candidate(contact)
+        if not candidate_name:
+            return response_text
+        if (
+            name_confirmation is not None
+            and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
+            and name_confirmation.resolved_name
+        ):
+            return response_text
+        prompt = (
+            f"Antes de seguir, ¿tu nombre es {candidate_name}? "
+            "Si no, compárteme tu nombre completo."
+        )
+        normalized_response = response_text.strip()
+        if not normalized_response:
+            return prompt
+        lowered_response = normalized_response.lower()
+        if candidate_name.lower() in lowered_response and "nombre" in lowered_response:
+            return normalized_response
+        if prompt in normalized_response:
+            return normalized_response
+        return f"{normalized_response} {prompt}".strip()
 
     def _build_calendar_note(self, upcoming_event: dict) -> str:
         return f"Ya existe una demo futura en calendario para el lead. Inicio: {upcoming_event.get('start_iso')}."

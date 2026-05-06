@@ -294,26 +294,28 @@ class ContextualNameConfirmationResolver:
         recent_messages: list[str],
     ) -> NameConfirmationDecision | None:
         candidate_name = get_name_confirmation_candidate(contact)
-        if contact is None or not candidate_name or self._llm is None:
+        if contact is None or self._llm is None:
             return None
 
         prompt = "\n".join(
             [
-                "You are validating whether a sales lead confirmed a candidate name from conversation context.",
+                "You are deciding whether the latest user turn establishes a reliable lead name for CRM use.",
                 "Return one decision only:",
                 "- confirmed_candidate_name",
                 "- provided_new_name",
                 "- rejected_candidate_name",
                 "- unclear",
                 "Use context, not keywords.",
-                "Only use provided_new_name when the lead explicitly gave a different real name.",
-                "Use confirmed_candidate_name when the lead naturally confirms the candidate suggested by the agent.",
-                "Do not confirm the candidate name if the latest user message only gives scheduling details, email, pricing questions, or any other information that does not directly answer the identity question.",
-                "Continuing the booking flow is not enough by itself to confirm the candidate name.",
+                "Use provided_new_name only when the lead clearly established a real person full name that should replace or fill the CRM name.",
+                "Use confirmed_candidate_name only when the lead confirmed the pending candidate name from context.",
+                "Use rejected_candidate_name only when the lead clearly rejects the pending candidate name.",
+                "If the latest user message is only scheduling, pricing, thanks, email, operational details, or anything else that does not establish a reliable person name, return unclear.",
+                "Continuing the booking flow is not enough by itself to confirm a name.",
+                "Be conservative. If there is any real doubt, return unclear.",
                 "",
                 f"Current CRM full_name: {(contact.full_name or '').strip() or 'None'}",
-                f"Candidate name pending confirmation: {candidate_name}",
-                f"Recent conversation: {recent_messages[-4:]}",
+                f"Candidate name pending confirmation: {candidate_name or 'None'}",
+                f"Recent conversation: {recent_messages[-6:]}",
                 f"Latest user message: {text}",
             ]
         )
