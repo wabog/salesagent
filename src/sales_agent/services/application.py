@@ -80,6 +80,13 @@ def _is_playground_event(event: InboundMessage) -> bool:
     return event.provider == "local-playground"
 
 
+def _should_include_message_in_context(message: ConversationMessage) -> bool:
+    message_type = str((message.metadata or {}).get("message_type") or "").strip().lower()
+    if message_type == "sticker":
+        return False
+    return not message.text.startswith("Sticker attached (")
+
+
 @dataclass
 class PreparedBatchRun:
     run_id: str
@@ -141,7 +148,7 @@ class SalesAgentApplication:
                     direction=Direction.INBOUND,
                     text=event.text,
                     created_at=event.timestamp,
-                    metadata={"provider": event.provider},
+                    metadata={"provider": event.provider, "message_type": event.message_type},
                 )
             )
 
@@ -150,10 +157,13 @@ class SalesAgentApplication:
     async def prepare_batched_run(self, events: list[InboundMessage]) -> PreparedBatchRun:
         anchor_event = events[-1]
         batch_message_ids = {event.message_id for event in events}
-        typing_stop_event, typing_task = self._start_typing_loop(anchor_event)
+        typing_stop_event = None
+        typing_task = None
 
         try:
             combined_text, planning_override = await self._build_combined_text(events)
+            if planning_override is None or planning_override.should_reply:
+                typing_stop_event, typing_task = self._start_typing_loop(anchor_event)
 
             provider_name_assessment = await self.name_validator.assess_provider_name(anchor_event.contact_name)
             contact = await self.crm_adapter.find_contact_by_phone(anchor_event.phone_number)
@@ -182,7 +192,11 @@ class SalesAgentApplication:
             conversation_recent = [
                 message
                 for message in conversation_recent
-                if message.message_id not in batch_message_ids and message.phone_number == anchor_event.phone_number
+                if (
+                    message.message_id not in batch_message_ids
+                    and message.phone_number == anchor_event.phone_number
+                    and _should_include_message_in_context(message)
+                )
             ]
             lead_recent: list[ConversationMessage] = []
             semantic_memory_groups: list[list[str]] = [
@@ -201,6 +215,7 @@ class SalesAgentApplication:
                     message
                     for message in lead_recent
                     if message.message_id not in batch_message_ids
+                    and _should_include_message_in_context(message)
                     and _ensure_utc_datetime(message.created_at)
                     >= _ensure_utc_datetime(anchor_event.timestamp) - timedelta(days=self.settings.phone_context_max_age_days)
                 ]
@@ -309,7 +324,12 @@ class SalesAgentApplication:
                 except Exception as exc:  # noqa: BLE001
                     tool_results.append(ToolExecutionResult(action=action, success=False, error=str(exc)))
 
-            prepared.response_text = self._finalize_response_text(prepared.response_text, tool_results, current_lead)
+            prepared.response_text = self._finalize_response_text(
+                prepared.response_text,
+                tool_results,
+                current_lead,
+                should_reply=planning.should_reply,
+            )
             if planning.knowledge_lookups:
                 logger.info(
                     "run_knowledge_lookup run_id=%s sections=%s",
@@ -468,6 +488,8 @@ class SalesAgentApplication:
         response_text: str,
         tool_results: list[ToolExecutionResult],
         contact: CRMContact | None,
+        *,
+        should_reply: bool,
     ) -> str:
         final_text = response_text.strip().replace("https://wabog.com/signup", "https://wabog.com")
         failed_meeting = next(
@@ -515,6 +537,9 @@ class SalesAgentApplication:
                     f"Si quieres, compárteme de nuevo el horario o usa este link: {self.settings.google_calendar_self_schedule_url}"
                 )
             return "Todavía no pude dejar la demo creada en calendario. Si quieres, confirmamos de nuevo el horario."
+
+        if not should_reply:
+            return ""
 
         upcoming_event = (((contact.metadata if contact else {}) or {}).get("calendar") or {}).get("upcoming_event")
         if upcoming_event and not final_text:

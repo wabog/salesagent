@@ -511,6 +511,102 @@ async def test_prepare_batched_run_sticker_only_skips_reply(monkeypatch):
     assert prepared.planning.intent == "non_text_ignored"
     assert prepared.planning.should_reply is False
     assert prepared.response_text == ""
+    assert prepared.typing_task is None
+    assert prepared.typing_stop_event is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_kapso_sticker_does_not_start_typing(monkeypatch):
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+    sent_typing: list[str] = []
+
+    async def fake_preprocess(event: InboundMessage) -> MediaPreprocessingResult:
+        return MediaPreprocessingResult(should_reply=False)
+
+    async def fake_send_typing_indicator(event: InboundMessage):  # noqa: ANN001
+        sent_typing.append(event.message_id)
+        return {"ok": True}
+
+    async with app.router.lifespan_context(app):
+        monkeypatch.setattr(app.state.sales_agent.media_preprocessor, "preprocess_event", fake_preprocess)
+        monkeypatch.setattr(app.state.sales_agent.channel_adapter, "send_typing_indicator", fake_send_typing_indicator)
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="sticker-kapso-1",
+                    conversation_id="conv-sticker-kapso",
+                    phone_number="3156832603",
+                    text="",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="kapso",
+                    message_type="sticker",
+                )
+            ]
+        )
+
+    assert prepared.planning.intent == "non_text_ignored"
+    assert sent_typing == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_batched_run_excludes_previous_sticker_from_recent_context():
+    app = create_app(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            MESSAGE_BATCH_WINDOW_SECONDS=0.05,
+        )
+    )
+
+    async with app.router.lifespan_context(app):
+        await app.state.sales_agent.memory_store.append_message(
+            ConversationMessage(
+                message_id="sticker-prev",
+                conversation_id="conv-sticker-context",
+                phone_number="3156832602",
+                direction=Direction.INBOUND,
+                text="Sticker attached (sticker.webp) [Size: 10 KB | Type: image/webp]",
+                metadata={"provider": "kapso", "message_type": "sticker"},
+            )
+        )
+        await app.state.sales_agent.memory_store.append_message(
+            ConversationMessage(
+                message_id="text-prev",
+                conversation_id="conv-sticker-context",
+                phone_number="3156832602",
+                direction=Direction.INBOUND,
+                text="quiero saber el precio",
+                metadata={"provider": "kapso", "message_type": "text"},
+            )
+        )
+
+        prepared = await app.state.sales_agent.prepare_batched_run(
+            [
+                InboundMessage(
+                    message_id="text-current",
+                    conversation_id="conv-sticker-context",
+                    phone_number="3156832602",
+                    text="y como lo pruebo",
+                    timestamp=datetime.now(timezone.utc),
+                    raw_payload={},
+                    provider="local-playground",
+                    message_type="text",
+                )
+            ]
+        )
+
+    recent_texts = [message.text for message in prepared.recent_messages]
+    assert "Sticker attached (sticker.webp) [Size: 10 KB | Type: image/webp]" not in recent_texts
+    assert "quiero saber el precio" in recent_texts
 
 
 @pytest.mark.asyncio

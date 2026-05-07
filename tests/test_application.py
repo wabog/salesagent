@@ -47,9 +47,14 @@ class _StubCalendarAdapter:
 class _CapturingChannelAdapter:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.typing_events: list[str] = []
 
     async def send_text(self, outbound):  # noqa: ANN001
         self.messages.append(outbound.text)
+
+    async def send_typing_indicator(self, event):  # noqa: ANN001
+        self.typing_events.append(event.message_id)
+        return {"ok": True}
 
 
 def build_application() -> SalesAgentApplication:
@@ -87,6 +92,7 @@ def test_finalize_response_text_degrades_failed_meeting_when_contact_data_missin
         "Perfecto, agendamos la demo y te envío la invitación.",
         tool_results,
         contact,
+        should_reply=True,
     )
 
     assert "todavía no la dejo agendada" in final_text.lower()
@@ -101,10 +107,35 @@ def test_finalize_response_text_normalizes_unpublished_wabog_signup_route():
         "Te dejo el link para probarlo: https://wabog.com/signup",
         [],
         None,
+        should_reply=True,
     )
 
     assert "https://wabog.com/signup" not in final_text
     assert "https://wabog.com" in final_text
+
+
+def test_finalize_response_text_keeps_non_reply_runs_empty_even_with_upcoming_event():
+    app = build_application()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        metadata={
+            "calendar": {
+                "upcoming_event": {"id": "evt-1", "start_iso": "2026-05-07T15:00:00-05:00"},
+            }
+        },
+    )
+
+    final_text = app._finalize_response_text(  # noqa: SLF001
+        "",
+        [],
+        contact,
+        should_reply=False,
+    )
+
+    assert final_text == ""
 
 
 @pytest.mark.asyncio
