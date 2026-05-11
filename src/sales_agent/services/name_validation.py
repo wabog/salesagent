@@ -308,6 +308,7 @@ class ContextualNameConfirmationResolver:
                 "Use context, not keywords.",
                 "Use provided_new_name only when the lead clearly established a real person full name that should replace or fill the CRM name.",
                 "Use confirmed_candidate_name only when the lead confirmed the pending candidate name from context.",
+                "If the recent agent turn asked whether the candidate name is correct and the latest user turn naturally confirms it, return confirmed_candidate_name even when the same turn also includes qualification details, scheduling details, or another answer.",
                 "Use rejected_candidate_name only when the lead clearly rejects the pending candidate name.",
                 "If the latest user message is only scheduling, pricing, thanks, email, operational details, or anything else that does not establish a reliable person name, return unclear.",
                 "Continuing the booking flow is not enough by itself to confirm a name.",

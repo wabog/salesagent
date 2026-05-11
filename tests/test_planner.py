@@ -384,7 +384,7 @@ def test_planning_guardrail_recreates_existing_meeting_when_new_time_is_requeste
     assert guarded.actions[1].args["event_id"] == "evt-old"
 
 
-def test_planning_guardrail_keeps_asking_for_name_while_confirmation_is_pending():
+def test_planning_guardrail_does_not_repeat_pending_name_prompt_after_it_was_asked():
     planner = build_planner()
     contact = CRMContact(
         external_id="lead-1",
@@ -411,11 +411,56 @@ def test_planning_guardrail_keeps_asking_for_name_while_confirmation_is_pending(
         result,
         "¿cuánto cuesta?",
         contact,
-        ["Perfecto, avanzamos con la demo."],
+        [
+            "Buenos días, ¿cómo puedo ayudarte hoy con Wabog? Antes de seguir, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo.",
+            "Si Fabian",
+            "Tengo 99 casos",
+        ],
     )
 
-    assert "tu nombre es fabian c villegas" in guarded.response_text.lower()
-    assert "compárteme tu nombre completo" in guarded.response_text.lower()
+    assert "enterprise" in guarded.response_text.lower()
+    assert "tu nombre es fabian c villegas" not in guarded.response_text.lower()
+    assert "compárteme tu nombre completo" not in guarded.response_text.lower()
+
+
+def test_planning_guardrail_strips_llm_repeated_pending_name_prompt_after_it_was_asked():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Lead Inicial",
+        email="lead@example.com",
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "Fabian C Villegas",
+                "normalized_name": "Fabian C Villegas",
+                "source": "provider_llm",
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="consult_price",
+        confidence=0.8,
+        response_text=(
+            "El plan Enterprise se revisa con ventas según volumen. "
+            "Antes de seguir, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo."
+        ),
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "Quiero saber cómo funciona y cuál es el costo",
+        contact,
+        [
+            "Buenos días, ¿cómo puedo ayudarte hoy con Wabog? Antes de seguir, ¿tu nombre es Fabian C Villegas? Si no, compárteme tu nombre completo.",
+            "Si Fabian",
+            "Tengo 99 casos",
+        ],
+    )
+
+    assert guarded.response_text == "El plan Enterprise se revisa con ventas según volumen."
 
 
 def test_repair_actions_allows_replacing_a_previously_confirmed_name():

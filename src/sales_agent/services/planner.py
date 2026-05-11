@@ -348,7 +348,8 @@ class AgentPlanner:
                 "Allowed special_case_intent values: none, ask_name, ask_contact_source.",
                 "Allowed inferred_stage values: Prospecto, Primer contacto, Demo agendada, Demo realizada, Propuesta enviada, Negociación, Prueba / Trial, Cliente, Perdido, No califica, or null.",
                 "Set should_complete_followup only when the latest user turn clearly means an existing follow-up is already done.",
-                "Set should_handoff_human only when the latest user turn clearly asks for a human or manual intervention.",
+                "Set should_handoff_human only when the latest user turn clearly asks to speak with a human, agent, asesor, or manual operator.",
+                "User frustration, complaints about too many questions, or requests to be more direct are not handoff requests by themselves.",
                 "Set should_offer_trial_response only when the latest user turn is clearly asking how to try, test, or start using Wabog.",
                 "Do not set should_offer_trial_response for generic questions about how Wabog works, objections about change, or pricing questions.",
                 "If the user only mentions a word inside their name, email, or other contact data, do not trigger a commercial intent from that word.",
@@ -662,7 +663,12 @@ class AgentPlanner:
             response_text = self._build_trial_response(response_text)
         else:
             response_text = self._normalize_wabog_urls(response_text)
-        response_text = self._ensure_pending_name_prompt(response_text, contact, name_confirmation)
+        response_text = self._ensure_pending_name_prompt(
+            response_text,
+            contact,
+            name_confirmation,
+            recent_messages,
+        )
 
         return result.model_copy(update={"actions": actions, "response_text": response_text})
 
@@ -1088,6 +1094,7 @@ class AgentPlanner:
         response_text: str,
         contact: CRMContact | None,
         name_confirmation: NameConfirmationDecision | None,
+        recent_messages: list[str] | None = None,
     ) -> str:
         candidate_name = get_name_confirmation_candidate(contact)
         if not candidate_name:
@@ -1098,6 +1105,8 @@ class AgentPlanner:
             and name_confirmation.resolved_name
         ):
             return response_text
+        if self._recently_asked_to_confirm_candidate_name(candidate_name, recent_messages or []):
+            return self._strip_redundant_pending_name_prompt(response_text, candidate_name)
         prompt = (
             f"Antes de seguir, ¿tu nombre es {candidate_name}? "
             "Si no, compárteme tu nombre completo."
@@ -1111,6 +1120,39 @@ class AgentPlanner:
         if prompt in normalized_response:
             return normalized_response
         return f"{normalized_response} {prompt}".strip()
+
+    def _recently_asked_to_confirm_candidate_name(self, candidate_name: str, recent_messages: list[str]) -> bool:
+        normalized_candidate = self._normalize_lookup_text(candidate_name)
+        if not normalized_candidate:
+            return False
+        for message in reversed(recent_messages[-8:]):
+            normalized_message = self._normalize_lookup_text(message)
+            if normalized_candidate not in normalized_message:
+                continue
+            if "nombre" in normalized_message and any(
+                token in normalized_message
+                for token in ("confirm", "ese es", "tu nombre", "registrado", "tengo como")
+            ):
+                return True
+        return False
+
+    def _strip_redundant_pending_name_prompt(self, response_text: str, candidate_name: str) -> str:
+        normalized_response = response_text.strip()
+        if not normalized_response:
+            return ""
+        if self._normalize_lookup_text(candidate_name) not in self._normalize_lookup_text(normalized_response):
+            return normalized_response
+
+        escaped_candidate = re.escape(candidate_name)
+        patterns = [
+            rf"\s*Antes de seguir,\s*¿tu nombre es {escaped_candidate}\?\s*Si no,\s*compárteme tu nombre completo\.?",
+            rf"\s*Antes de agendarla,\s*¿tu nombre es {escaped_candidate}\?\s*Si no,\s*compárteme tu nombre completo\.?",
+            rf"\s*¿Tu nombre es {escaped_candidate}\?\s*Si no,\s*compárteme tu nombre completo\.?",
+        ]
+        cleaned = normalized_response
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+        return cleaned or normalized_response
 
     def _build_calendar_note(self, upcoming_event: dict) -> str:
         return f"Ya existe una demo futura en calendario para el lead. Inicio: {upcoming_event.get('start_iso')}."
