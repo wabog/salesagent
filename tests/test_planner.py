@@ -384,6 +384,75 @@ def test_planning_guardrail_recreates_existing_meeting_when_new_time_is_requeste
     assert guarded.actions[1].args["event_id"] == "evt-old"
 
 
+def test_planning_guardrail_recreates_existing_meeting_when_only_new_hour_is_requested():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        stage="Demo agendada",
+        metadata={
+            "name_validation": {"status": "trusted", "source": "user_message"},
+            "calendar": {
+                "connected": True,
+                "upcoming_event": {
+                    "id": "evt-old",
+                    "start_iso": "2030-05-07T11:00:00-05:00",
+                },
+            },
+        },
+    )
+    result = PlanningResult(
+        intent="reprogram_demo",
+        confidence=0.87,
+        response_text="Voy a revisar la reprogramación.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "Puedes re programarla para las 2 pm ?",
+        contact,
+        [],
+    )
+
+    assert [action.type for action in guarded.actions] == [
+        ActionType.CREATE_MEETING,
+        ActionType.DELETE_MEETING,
+    ]
+    assert guarded.actions[0].args["start_iso"] == "2030-05-07T14:00:00-05:00"
+    assert guarded.actions[1].args["event_id"] == "evt-old"
+
+
+def test_planning_guardrail_creates_meeting_from_context_day_and_current_hour():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        stage="Primer contacto",
+        metadata={"name_validation": {"status": "trusted", "source": "user_message"}},
+    )
+    result = PlanningResult(
+        intent="reprogram_demo",
+        confidence=0.87,
+        response_text="Voy a revisar la reprogramación.",
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "Puedes re programarla para las 2 pm ?",
+        contact,
+        ["¿Quieres que te ayude con la demo que tienes agendada para mañana a las 11 am?"],
+    )
+
+    assert [action.type for action in guarded.actions] == [ActionType.CREATE_MEETING]
+    assert guarded.actions[0].args["start_iso"].endswith("T14:00:00-05:00")
+
+
 def test_planning_guardrail_does_not_repeat_pending_name_prompt_after_it_was_asked():
     planner = build_planner()
     contact = CRMContact(

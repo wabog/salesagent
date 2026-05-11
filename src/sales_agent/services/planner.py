@@ -547,7 +547,7 @@ class AgentPlanner:
             and upcoming_event is None
             and not any(action.type == ActionType.CREATE_MEETING for action in actions)
             and not actions
-            and self._current_turn_can_finish_booking(text, name_confirmation)
+            and self._current_turn_can_finish_booking(text, name_confirmation, recent_messages, projected_contact)
         ):
             actions.append(
                 ProposedAction(
@@ -564,7 +564,7 @@ class AgentPlanner:
             and not any(action.type == ActionType.CREATE_MEETING for action in actions)
             and name_confirmation is not None
             and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
-            and self._current_turn_can_finish_booking(text, name_confirmation)
+            and self._current_turn_can_finish_booking(text, name_confirmation, recent_messages, projected_contact)
         ):
             actions.append(
                 ProposedAction(
@@ -579,7 +579,7 @@ class AgentPlanner:
             and meeting_payload is not None
             and not missing_meeting_fields
             and not any(action.type == ActionType.CREATE_MEETING for action in actions)
-            and self._current_turn_can_finish_booking(text, name_confirmation)
+            and self._current_turn_can_finish_booking(text, name_confirmation, recent_messages, projected_contact)
         ):
             actions.append(
                 ProposedAction(
@@ -684,6 +684,8 @@ class AgentPlanner:
         self,
         text: str,
         name_confirmation: NameConfirmationDecision | None = None,
+        recent_messages: list[str] | None = None,
+        contact: CRMContact | None = None,
     ) -> bool:
         lowered = text.lower().strip()
         if re.search(
@@ -691,12 +693,23 @@ class AgentPlanner:
             lowered,
         ) and re.search(r"\b\d{1,2}(?::\d{2})?\s*(am|pm)?\b", lowered):
             return True
+        if (
+            self._extract_time_of_day(text) is not None
+            and self._meeting_context_date(contact, recent_messages or [], ZoneInfo(self._settings.google_calendar_timezone)) is not None
+        ):
+            return True
         if self._extract_email(text) is not None:
             return True
         return bool(
             name_confirmation is not None
             and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
         )
+
+    def _text_mentions_meeting_date(self, text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\b(hoy|mañana|manana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", lowered):
+            return True
+        return bool(re.search(r"\b20\d{2}-\d{2}-\d{2}\b", lowered))
 
     def _build_trial_response(self, response_text: str) -> str:
         normalized = self._normalize_wabog_urls(response_text)
@@ -870,6 +883,9 @@ class AgentPlanner:
         recent_messages: list[str] | None = None,
     ) -> dict[str, str | int] | None:
         start_at = self._extract_requested_meeting_start(text, recent_messages)
+        time_only_start_at = None if self._text_mentions_meeting_date(text) else self._extract_time_only_meeting_start(text, contact, recent_messages)
+        if time_only_start_at is not None:
+            start_at = time_only_start_at
         if start_at is None:
             pending_start_iso = str((((contact.metadata if contact else {}) or {}).get("live_context") or {}).get("pending_booking_start_iso") or "").strip()
             if pending_start_iso:
@@ -894,6 +910,121 @@ class AgentPlanner:
             "title": f"Demo Wabog - {lead_label}",
             "description": " ".join(description_parts),
         }
+
+    def _extract_time_only_meeting_start(
+        self,
+        text: str,
+        contact: CRMContact | None,
+        recent_messages: list[str] | None = None,
+    ) -> datetime | None:
+        time_parts = self._extract_time_of_day(text)
+        if time_parts is None:
+            return None
+
+        tz = ZoneInfo(self._settings.google_calendar_timezone)
+        target_date = self._meeting_context_date(contact, recent_messages or [], tz)
+        if target_date is None:
+            return None
+
+        hour, minute = time_parts
+        return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+
+    def _extract_time_of_day(self, text: str) -> tuple[int, int] | None:
+        lowered = text.lower()
+        match = re.search(
+            r"(?:a\s+las\s+|a\s+la\s+|tipo\s+|para\s+las\s+|para\s+la\s+)?"
+            r"(\d{1,2})(?::(\d{2}))?\s*(a\.?\s*m\.?|p\.?\s*m\.?)?\b",
+            lowered,
+        )
+        if not match:
+            return None
+        hour_raw, minute_raw, meridiem_raw = match.groups()
+        hour = int(hour_raw)
+        if hour > 12 and meridiem_raw:
+            return None
+        minute = int(minute_raw or "0")
+        if minute > 59:
+            return None
+        meridiem = re.sub(r"[^apm]", "", meridiem_raw or "")
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif not meridiem and 1 <= hour <= 7:
+            hour += 12
+        if hour > 23:
+            return None
+        return hour, minute
+
+    def _meeting_context_date(
+        self,
+        contact: CRMContact | None,
+        recent_messages: list[str],
+        tz: ZoneInfo,
+    ) -> date | None:
+        upcoming_event = self._get_upcoming_calendar_event(contact)
+        upcoming_start = str((upcoming_event or {}).get("start_iso") or "").strip()
+        if upcoming_start:
+            try:
+                return datetime.fromisoformat(upcoming_start).astimezone(tz).date()
+            except ValueError:
+                pass
+
+        pending_start_iso = str((((contact.metadata if contact else {}) or {}).get("live_context") or {}).get("pending_booking_start_iso") or "").strip()
+        if pending_start_iso:
+            try:
+                return datetime.fromisoformat(pending_start_iso).astimezone(tz).date()
+            except ValueError:
+                pass
+
+        base_date = datetime.now(tz).date()
+        weekday_map = {
+            "lunes": 0,
+            "martes": 1,
+            "miercoles": 2,
+            "miércoles": 2,
+            "jueves": 3,
+            "viernes": 4,
+            "sabado": 5,
+            "sábado": 5,
+            "domingo": 6,
+        }
+        for message in reversed(recent_messages[-8:]):
+            lowered = message.lower()
+            if not self._looks_like_booking_context(lowered):
+                continue
+            if isoish_match := re.search(r"\b(20\d{2}-\d{2}-\d{2})[ t]\d{1,2}:\d{2}\b", lowered):
+                return date.fromisoformat(isoish_match.group(1))
+            if re.search(r"\bhoy\b", lowered):
+                return base_date
+            if re.search(r"\b(mañana|manana)\b", lowered):
+                return base_date + timedelta(days=1)
+            if weekday_match := re.search(
+                r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b",
+                lowered,
+            ):
+                weekday = weekday_map[weekday_match.group(1)]
+                days_ahead = (weekday - base_date.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                return base_date + timedelta(days=days_ahead)
+        return None
+
+    def _looks_like_booking_context(self, lowered_text: str) -> bool:
+        return any(
+            token in lowered_text
+            for token in (
+                "demo",
+                "agend",
+                "reprogram",
+                "program",
+                "reunión",
+                "reunion",
+                "meet",
+                "invitación",
+                "invitacion",
+            )
+        )
 
     def _extract_current_tool(self, text: str) -> str | None:
         patterns = (
