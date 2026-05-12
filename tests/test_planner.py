@@ -41,7 +41,7 @@ def test_serialize_contact_for_prompt_uses_curated_crm_context():
         email="fabian@example.com",
         stage="Primer contacto",
         followup_summary="Coordinar fecha y hora para demo comercial.",
-        followup_due_date=date(2026, 5, 5),
+        followup_due_date=date.today() + timedelta(days=1),
         notes=[
             "2026-05-01 - Lead confirmó volumen alto.",
             "2026-05-02 - Usa Excel para seguimiento.",
@@ -59,6 +59,26 @@ def test_serialize_contact_for_prompt_uses_curated_crm_context():
     assert "2026-05-02 - Usa Excel para seguimiento." in rendered
     assert "raw_properties" not in rendered
     assert "Fabian Cuero Villegas" in rendered
+
+
+def test_serialize_contact_for_prompt_omits_past_followup():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero Villegas",
+        email="fabian@example.com",
+        stage="Primer contacto",
+        followup_summary="Asistir a la demo agendada para 2026-05-07T15:00:00-05:00 y continuar seguimiento comercial.",
+        followup_due_date=date(2026, 5, 7),
+        metadata={"name_validation": {"status": "trusted", "source": "user_message"}},
+    )
+
+    rendered = planner._serialize_contact_for_prompt(contact)  # noqa: SLF001
+
+    assert '"followup_summary": null' in rendered
+    assert '"followup_due_date": null' in rendered
+    assert "2026-05-07T15:00:00-05:00" not in rendered
 
 
 def test_serialize_contact_for_prompt_omits_past_cached_upcoming_event():

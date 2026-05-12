@@ -252,8 +252,8 @@ class AgentPlanner:
             "full_name": effective_name,
             "stage": contact.stage,
             "email": contact.email,
-            "followup_summary": contact.followup_summary,
-            "followup_due_date": contact.followup_due_date.isoformat() if contact.followup_due_date else None,
+            "followup_summary": contact.followup_summary if self._is_current_or_future_date(contact.followup_due_date) else None,
+            "followup_due_date": contact.followup_due_date.isoformat() if self._is_current_or_future_date(contact.followup_due_date) else None,
             "recent_notes": contact.notes[-self._settings.crm_notes_context_limit :],
             "live_context": {
                 "effective_name": effective_name,
@@ -1226,6 +1226,11 @@ class AgentPlanner:
         if reference_time.astimezone(timezone.utc) <= datetime.now(timezone.utc):
             return None
         return event
+
+    def _is_current_or_future_date(self, value: date | None) -> bool:
+        if value is None:
+            return False
+        return value >= datetime.now(ZoneInfo(self._settings.google_calendar_timezone)).date()
 
     def _meeting_start_changed(self, upcoming_event: dict | None, meeting_payload: dict | None) -> bool:
         if not upcoming_event or not meeting_payload:

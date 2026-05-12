@@ -12,7 +12,11 @@ from sales_agent.domain.models import (
     ToolExecutionResult,
 )
 from sales_agent.services.name_validation import NameCandidateAssessment, NameConfirmationDecision, apply_name_validation_metadata
-from sales_agent.services.application import PreparedBatchRun, SalesAgentApplication
+from sales_agent.services.application import (
+    PreparedBatchRun,
+    SalesAgentApplication,
+    _should_keep_text_for_contact_context,
+)
 
 
 class _StubCalendarAdapter:
@@ -164,6 +168,20 @@ def test_finalize_response_text_ignores_past_cached_upcoming_event():
     )
 
     assert final_text == ""
+
+
+def test_contact_context_filters_existing_demo_claim_when_no_upcoming_event():
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        metadata={"calendar": {"upcoming_event": None}},
+    )
+
+    assert not _should_keep_text_for_contact_context(
+        "¿Quieres que te recuerde el enlace de la demo agendada para el 7 de mayo?",
+        contact,
+    )
+    assert _should_keep_text_for_contact_context("Hola, ¿en qué puedo ayudarte con Wabog?", contact)
 
 
 @pytest.mark.asyncio
