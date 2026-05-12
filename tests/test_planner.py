@@ -107,6 +107,7 @@ def test_serialize_contact_for_prompt_omits_past_cached_upcoming_event():
     rendered = planner._serialize_contact_for_prompt(contact)  # noqa: SLF001
 
     assert '"upcoming_event": null' in rendered
+    assert '"has_future_meeting": false' in rendered
     assert '"just_booked": false' in rendered
 
 
@@ -122,7 +123,8 @@ def test_compose_llm_prompt_includes_current_datetime():
     )
 
     assert "Current datetime (America/Bogota):" in prompt
-    assert "Treat calendar events before this instant as past" in prompt
+    assert "Recent messages and semantic memories are historical conversation text" in prompt
+    assert "If Contact.metadata.calendar.upcoming_event is null" in prompt
 
 
 def test_repair_actions_does_not_guess_stage_when_llm_omits_it():

@@ -87,48 +87,6 @@ def _should_include_message_in_context(message: ConversationMessage) -> bool:
     return not message.text.startswith("Sticker attached (")
 
 
-def _has_current_upcoming_event(contact: CRMContact | None) -> bool:
-    if contact is None:
-        return False
-    event = ((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")
-    if not event:
-        return False
-    reference_iso = str(event.get("end_iso") or event.get("start_iso") or "").strip()
-    if not reference_iso:
-        return False
-    try:
-        reference_time = datetime.fromisoformat(reference_iso)
-    except ValueError:
-        return False
-    return _ensure_utc_datetime(reference_time) > datetime.now(UTC)
-
-
-def _looks_like_existing_demo_claim(text: str) -> bool:
-    lowered = text.lower()
-    demo_tokens = (
-        "demo agendada",
-        "demo está agendada",
-        "demo esta agendada",
-        "te dejé la demo agendada",
-        "te deje la demo agendada",
-        "tienes una demo",
-        "tu demo",
-        "enlace de la demo",
-        "link de la demo",
-    )
-    return "demo" in lowered and any(token in lowered for token in demo_tokens)
-
-
-def _should_keep_text_for_contact_context(text: str, contact: CRMContact | None) -> bool:
-    if _has_current_upcoming_event(contact):
-        return True
-    return not _looks_like_existing_demo_claim(text)
-
-
-def _should_keep_message_for_contact_context(message: ConversationMessage, contact: CRMContact | None) -> bool:
-    return _should_include_message_in_context(message) and _should_keep_text_for_contact_context(message.text, contact)
-
-
 @dataclass
 class PreparedBatchRun:
     run_id: str
@@ -237,7 +195,7 @@ class SalesAgentApplication:
                 if (
                     message.message_id not in batch_message_ids
                     and message.phone_number == anchor_event.phone_number
-                    and _should_keep_message_for_contact_context(message, contact)
+                    and _should_include_message_in_context(message)
                 )
             ]
             lead_recent: list[ConversationMessage] = []
@@ -257,7 +215,7 @@ class SalesAgentApplication:
                     message
                     for message in lead_recent
                     if message.message_id not in batch_message_ids
-                    and _should_keep_message_for_contact_context(message, contact)
+                    and _should_include_message_in_context(message)
                     and _ensure_utc_datetime(message.created_at)
                     >= _ensure_utc_datetime(anchor_event.timestamp) - timedelta(days=self.settings.phone_context_max_age_days)
                 ]
@@ -275,11 +233,6 @@ class SalesAgentApplication:
                 limit=self.settings.recent_message_context_limit,
             )
             semantic_memories = _merge_unique_texts(*semantic_memory_groups, limit=self.settings.semantic_memory_limit)
-            semantic_memories = [
-                memory
-                for memory in semantic_memories
-                if _should_keep_text_for_contact_context(memory, contact)
-            ]
             planning = planning_override or await self.workflow.planner.plan(
                 text=combined_text,
                 contact=contact,
