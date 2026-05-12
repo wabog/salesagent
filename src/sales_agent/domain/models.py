@@ -68,6 +68,24 @@ class OutboundMessage(BaseModel):
         return normalize_phone_number(value)
 
 
+class OutboundTemplateMessage(BaseModel):
+    conversation_id: str
+    phone_number: str
+    template_name: str
+    language_code: str
+    body_parameters: list[dict[str, str]]
+    rendered_text: str
+    callback_data: str | None = None
+    phone_number_id: str | None = None
+    channel: Channel = Channel.WHATSAPP
+    provider: str = "kapso"
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        return normalize_phone_number(value)
+
+
 class CRMContact(BaseModel):
     external_id: str
     phone_number: str

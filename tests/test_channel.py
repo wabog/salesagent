@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from sales_agent.adapters.channel import KapsoWhatsAppAdapter
 from sales_agent.core.config import Settings
-from sales_agent.domain.models import InboundMessage, OutboundMessage
+from sales_agent.domain.models import InboundMessage, OutboundMessage, OutboundTemplateMessage
 
 
 @pytest.mark.asyncio
@@ -121,4 +121,85 @@ async def test_kapso_adapter_typing_indicator_uses_mark_read_payload(monkeypatch
         "status": "read",
         "message_id": "wamid.123",
         "typing_indicator": {"type": "text"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_kapso_adapter_sends_template_payload(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"messages": [{"id": "wamid.out"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    adapter = KapsoWhatsAppAdapter(
+        Settings(
+            DATABASE_URL="sqlite+aiosqlite:///:memory:",
+            OPENAI_API_KEY="",
+            CRM_BACKEND="memory",
+            KAPSO_BASE_URL="https://api.kapso.ai",
+            KAPSO_PHONE_NUMBER_ID="1101272743059797",
+            KAPSO_API_TOKEN="kapso-token",
+            WHATSAPP_SEND_ENABLED="true",
+        )
+    )
+
+    result = await adapter.send_template(
+        OutboundTemplateMessage(
+            conversation_id="conv-1",
+            phone_number="+57 300 1112233",
+            template_name="wabog_gentle_reactivation",
+            language_code="es",
+            body_parameters=[
+                {"type": "text", "text": "buen día"},
+                {"type": "text", "text": "Fabian"},
+            ],
+            rendered_text="Hola buen día, soy Fabian de Wabog.",
+            callback_data="campaign=test;recipient=abc",
+        )
+    )
+
+    assert result == {"messages": [{"id": "wamid.out"}]}
+    assert captured["url"] == "https://api.kapso.ai/meta/whatsapp/v24.0/1101272743059797/messages"
+    assert captured["headers"] == {"X-API-Key": "kapso-token"}
+    assert captured["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "573001112233",
+        "type": "template",
+        "template": {
+            "name": "wabog_gentle_reactivation",
+            "language": {"code": "es"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": "buen día"},
+                        {"type": "text", "text": "Fabian"},
+                    ],
+                }
+            ],
+        },
+        "biz_opaque_callback_data": "campaign=test;recipient=abc",
     }

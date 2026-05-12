@@ -138,6 +138,34 @@ def test_finalize_response_text_keeps_non_reply_runs_empty_even_with_upcoming_ev
     assert final_text == ""
 
 
+def test_finalize_response_text_ignores_past_cached_upcoming_event():
+    app = build_application()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero",
+        email="fabian@example.com",
+        metadata={
+            "calendar": {
+                "upcoming_event": {
+                    "id": "evt-old",
+                    "start_iso": "2026-05-07T15:00:00-05:00",
+                    "end_iso": "2026-05-07T15:30:00-05:00",
+                },
+            }
+        },
+    )
+
+    final_text = app._finalize_response_text(  # noqa: SLF001
+        "",
+        [],
+        contact,
+        should_reply=True,
+    )
+
+    assert final_text == ""
+
+
 @pytest.mark.asyncio
 async def test_commit_batched_run_syncs_crm_after_meeting_creation():
     app = build_application()

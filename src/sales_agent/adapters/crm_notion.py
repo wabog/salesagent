@@ -161,11 +161,52 @@ class NotionCRMAdapter:
             "provider": "notion",
         }
 
+    async def list_contacts_by_property_filters(self, conditions: list[dict[str, str]]) -> list[CRMContact]:
+        contacts: list[CRMContact] = []
+        start_cursor: str | None = None
+        while True:
+            payload: dict[str, Any] = {
+                "page_size": 100,
+                "filter": self._build_filter_payload(conditions),
+            }
+            if start_cursor:
+                payload["start_cursor"] = start_cursor
+            data = await self._request(
+                "POST",
+                f"/data_sources/{self._settings.notion_data_source_id}/query",
+                json=payload,
+            )
+            for page in data.get("results", []):
+                if page.get("archived") or page.get("in_trash"):
+                    continue
+                contacts.append(self._to_contact(page))
+            if not data.get("has_more"):
+                return contacts
+            start_cursor = data.get("next_cursor")
+
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
         async with httpx.AsyncClient(base_url=self._base_url, timeout=20.0) as client:
             response = await client.request(method, path, headers=self._base_headers, json=json)
             response.raise_for_status()
             return response.json()
+
+    def _build_filter_payload(self, conditions: list[dict[str, str]]) -> dict[str, Any]:
+        filters = [self._build_property_filter(condition) for condition in conditions]
+        if not filters:
+            return {}
+        if len(filters) == 1:
+            return filters[0]
+        return {"and": filters}
+
+    def _build_property_filter(self, condition: dict[str, str]) -> dict[str, Any]:
+        prop = condition["property"]
+        prop_type = condition.get("type", "select")
+        equals = condition["equals"]
+        if prop_type in {"select", "status", "email", "phone_number"}:
+            return {"property": prop, prop_type: {"equals": equals}}
+        if prop_type in {"rich_text", "title"}:
+            return {"property": prop, prop_type: {"equals": equals}}
+        raise ValueError(f"Unsupported Notion filter property type: {prop_type}")
 
     async def _query_by_exact_phone(self, phone_number: str) -> dict[str, Any] | None:
         payload = {

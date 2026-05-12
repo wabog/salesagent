@@ -230,6 +230,59 @@ class ContactNameValidator:
             source="provider",
         )
 
+    async def assess_outbound_greeting_name(self, candidate: str | None) -> NameCandidateAssessment:
+        normalized_name = normalize_person_name(candidate)
+        if not normalized_name:
+            return NameCandidateAssessment(status="rejected", confidence=0.0, source="outbound_greeting")
+
+        if self._llm is None:
+            return NameCandidateAssessment(
+                status="trusted" if is_specific_person_name(normalized_name) else "rejected",
+                confidence=0.65 if is_specific_person_name(normalized_name) else 0.0,
+                normalized_name=normalized_name,
+                candidate_name=normalized_name,
+                source="outbound_greeting_fallback",
+            )
+
+        try:
+            output = await self._llm.ainvoke(
+                "\n".join(
+                    [
+                        "Decide if this CRM field is a real person's name suitable for greeting a lead in an outbound WhatsApp message.",
+                        "Be strict. Only accept real human names.",
+                        "Reject company names, handles, campaign labels, roles, generic words, phone numbers, emails, city names, and one-word ambiguous values.",
+                        "If accepted, return the best normalized person name.",
+                        f"Candidate: {candidate}",
+                        f"Normalized: {normalized_name}",
+                    ]
+                )
+            )
+        except OpenAIError:
+            return NameCandidateAssessment(
+                status="rejected",
+                confidence=0.0,
+                normalized_name=normalized_name,
+                candidate_name=normalized_name,
+                source="outbound_greeting_llm_error",
+            )
+
+        llm_name = normalize_person_name(output.normalized_name or normalized_name)
+        if output.looks_like_real_name and output.confidence >= 0.8 and llm_name:
+            return NameCandidateAssessment(
+                status="trusted",
+                confidence=output.confidence,
+                normalized_name=llm_name,
+                candidate_name=llm_name,
+                source="outbound_greeting_llm",
+            )
+        return NameCandidateAssessment(
+            status="rejected",
+            confidence=output.confidence,
+            normalized_name=llm_name,
+            candidate_name=llm_name,
+            source="outbound_greeting_llm",
+        )
+
     async def _assess_with_llm(
         self,
         candidate: str,

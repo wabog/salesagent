@@ -61,6 +61,50 @@ def test_serialize_contact_for_prompt_uses_curated_crm_context():
     assert "Fabian Cuero Villegas" in rendered
 
 
+def test_serialize_contact_for_prompt_omits_past_cached_upcoming_event():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="Fabian Cuero Villegas",
+        email="fabian@example.com",
+        stage="Demo agendada",
+        metadata={
+            "name_validation": {"status": "trusted", "source": "user_message"},
+            "calendar": {
+                "connected": True,
+                "available": True,
+                "upcoming_event": {
+                    "id": "past-event",
+                    "start_iso": "2026-05-07T15:00:00-05:00",
+                    "end_iso": "2026-05-07T15:30:00-05:00",
+                },
+                "just_booked": True,
+            },
+        },
+    )
+
+    rendered = planner._serialize_contact_for_prompt(contact)  # noqa: SLF001
+
+    assert '"upcoming_event": null' in rendered
+    assert '"just_booked": false' in rendered
+
+
+def test_compose_llm_prompt_includes_current_datetime():
+    planner = build_planner()
+
+    prompt = planner._compose_llm_prompt(  # noqa: SLF001
+        contact_json="None",
+        recent_messages="[]",
+        semantic_memories="[]",
+        knowledge_context="",
+        text="hola",
+    )
+
+    assert "Current datetime (America/Bogota):" in prompt
+    assert "Treat calendar events before this instant as past" in prompt
+
+
 def test_repair_actions_does_not_guess_stage_when_llm_omits_it():
     planner = build_planner()
     result = PlanningResult(
@@ -357,7 +401,7 @@ def test_planning_guardrail_recreates_existing_meeting_when_new_time_is_requeste
                 "connected": True,
                 "upcoming_event": {
                     "id": "evt-old",
-                    "start_iso": "2026-05-07T10:00:00-05:00",
+                    "start_iso": "2030-05-07T10:00:00-05:00",
                 },
             },
         },

@@ -61,7 +61,7 @@ async def enrich_contact_with_calendar(contact: CRMContact, calendar_adapter, se
 
     previous_event_id = ((previous_calendar.get("upcoming_event") or {}).get("id"))
     current_event_id = (upcoming_event or {}).get("id")
-    if upcoming_event is None and previous_calendar.get("upcoming_event"):
+    if upcoming_event is None and _is_future_calendar_event(previous_calendar.get("upcoming_event")):
         upcoming_event = previous_calendar.get("upcoming_event")
         current_event_id = (upcoming_event or {}).get("id")
     calendar_state["available"] = True
@@ -69,3 +69,19 @@ async def enrich_contact_with_calendar(contact: CRMContact, calendar_adapter, se
     calendar_state["just_booked"] = bool(current_event_id and current_event_id != previous_event_id)
     metadata["calendar"] = calendar_state
     return contact.model_copy(update={"metadata": metadata})
+
+
+def _is_future_calendar_event(event: dict[str, Any] | None, *, now: datetime | None = None) -> bool:
+    if not event:
+        return False
+    current_time = now or datetime.now(timezone.utc)
+    reference_iso = str(event.get("end_iso") or event.get("start_iso") or "").strip()
+    if not reference_iso:
+        return False
+    try:
+        reference_time = datetime.fromisoformat(reference_iso)
+    except ValueError:
+        return False
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    return reference_time.astimezone(timezone.utc) > current_time.astimezone(timezone.utc)

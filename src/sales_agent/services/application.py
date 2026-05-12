@@ -541,7 +541,7 @@ class SalesAgentApplication:
         if not should_reply:
             return ""
 
-        upcoming_event = (((contact.metadata if contact else {}) or {}).get("calendar") or {}).get("upcoming_event")
+        upcoming_event = self.workflow.planner._get_upcoming_calendar_event(contact)  # noqa: SLF001
         if upcoming_event and not final_text:
             return f"Veo una demo futura agendada para {upcoming_event.get('start_iso')}."
         return final_text
@@ -589,7 +589,7 @@ class SalesAgentApplication:
             result.success and result.action.type == ActionType.CREATE_MEETING
             for result in tool_results
         )
-        has_upcoming_event = bool((((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")))
+        has_upcoming_event = self.workflow.planner._get_upcoming_calendar_event(contact) is not None  # noqa: SLF001
         if has_successful_meeting or has_upcoming_event:
             live_context.pop("pending_booking_start_iso", None)
         else:

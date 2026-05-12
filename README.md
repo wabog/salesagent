@@ -91,6 +91,7 @@ Los prompts y el knowledge del agente viven en archivos `.md` dentro del repo y 
 - `business rules`: brief comercial, segmentación, calificación y CTA.
 - `knowledge`: secciones consultables por el agente bajo demanda, por ejemplo compañía, pricing, FAQ o integraciones.
 - `docs/agent_behavior.md`: reglas de diseño del agente, política de guardrails y explicación técnica de `candidate_name`.
+- `docs/outbound_campaigns.md`: infraestructura genérica para campañas outbound con templates de WhatsApp, memoria, scheduling y cambios de etapa.
 
 El playground ya no permite editar prompts. Solo muestra en lectura el scaffold del planner y las secciones de knowledge cargadas desde archivos versionados.
 
@@ -157,3 +158,23 @@ El agente no tiene queries abiertas sobre el CRM. Las actions de negocio se ejec
 7. Clasifica intención y planea acciones sobre ese lead únicamente.
 8. Ejecuta tools limitadas al `current_lead`.
 9. Persiste el run y envía una sola respuesta para el lote.
+
+## Campañas outbound
+
+El repo incluye infraestructura genérica para campañas outbound por WhatsApp, pero no hay una campaña productiva creada por defecto.
+
+La lógica vive en:
+
+- `src/sales_agent/services/outbound_campaigns.py`
+- `src/sales_agent/outbound_cli.py`
+- `src/sales_agent/adapters/channel.py`
+
+Comandos disponibles:
+
+```bash
+python -m sales_agent.outbound_cli seed path/to/campaign.json
+python -m sales_agent.outbound_cli run-once path/to/campaign.json
+python -m sales_agent.outbound_cli scheduler-tick path/to/campaigns-dir
+```
+
+El flujo outbound guarda el mensaje renderizado en memoria como `OUTBOUND` antes de que el lead responda, y solo aplica cambios posteriores de CRM si Kapso acepta el envío. Revisa [`docs/outbound_campaigns.md`](/home/gidiom/Wabog/salesAgent/docs/outbound_campaigns.md) antes de crear o activar una campaña.

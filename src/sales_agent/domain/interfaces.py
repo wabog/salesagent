@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, KnowledgeLookup, OutboundMessage, ToolExecutionResult
+from sales_agent.domain.models import (
+    CRMContact,
+    ConversationMessage,
+    InboundMessage,
+    KnowledgeLookup,
+    OutboundMessage,
+    OutboundTemplateMessage,
+    ToolExecutionResult,
+)
 
 
 class CRMAdapter(Protocol):
@@ -51,5 +59,7 @@ class MemoryStore(Protocol):
 
 class ChannelAdapter(Protocol):
     async def send_text(self, message: OutboundMessage) -> dict: ...
+
+    async def send_template(self, message: OutboundTemplateMessage) -> dict: ...
 
     async def send_typing_indicator(self, event: InboundMessage) -> dict: ...

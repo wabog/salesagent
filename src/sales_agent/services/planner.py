@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from openai import OpenAIError
@@ -218,6 +218,10 @@ class AgentPlanner:
             "# Knowledge Context",
             knowledge_context or "No additional knowledge loaded for this turn.",
             "",
+            f"Current datetime ({self._settings.google_calendar_timezone}):",
+            datetime.now(ZoneInfo(self._settings.google_calendar_timezone)).isoformat(),
+            "Treat calendar events before this instant as past, not upcoming.",
+            "",
             "Contact:",
             contact_json,
             "",
@@ -237,6 +241,7 @@ class AgentPlanner:
             return "None"
         metadata = dict(contact.metadata or {})
         calendar = dict((metadata.get("calendar") or {}))
+        upcoming_event = self._get_upcoming_calendar_event(contact)
         name_validation = dict((metadata.get("name_validation") or {}))
         effective_name = get_effective_contact_name(contact)
         candidate_name = get_name_confirmation_candidate(contact)
@@ -268,8 +273,8 @@ class AgentPlanner:
                     "connected": calendar.get("connected"),
                     "available": calendar.get("available"),
                     "self_schedule_url": calendar.get("self_schedule_url"),
-                    "upcoming_event": calendar.get("upcoming_event"),
-                    "just_booked": calendar.get("just_booked"),
+                    "upcoming_event": upcoming_event,
+                    "just_booked": bool(calendar.get("just_booked")) and upcoming_event is not None,
                 }
                 if calendar
                 else None,
@@ -1206,7 +1211,21 @@ class AgentPlanner:
     def _get_upcoming_calendar_event(self, contact: CRMContact | None) -> dict | None:
         if contact is None:
             return None
-        return ((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")
+        event = ((contact.metadata or {}).get("calendar") or {}).get("upcoming_event")
+        if not event:
+            return None
+        reference_iso = str(event.get("end_iso") or event.get("start_iso") or "").strip()
+        if not reference_iso:
+            return None
+        try:
+            reference_time = datetime.fromisoformat(reference_iso)
+        except ValueError:
+            return None
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+        if reference_time.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return None
+        return event
 
     def _meeting_start_changed(self, upcoming_event: dict | None, meeting_payload: dict | None) -> bool:
         if not upcoming_event or not meeting_payload:
