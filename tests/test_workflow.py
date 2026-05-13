@@ -72,7 +72,9 @@ async def test_workflow_creates_contact_and_updates_stage():
     assert contact.stage == "Demo"
     assert len(recent) == 2
     assert "Ya registré este número como lead en el CRM." not in result.response_text
-    assert result.response_text.startswith("Actualicé la etapa del lead a Demo.")
+    assert result.response_text == "Listo, dejé actualizado el seguimiento para continuar."
+    assert "etapa" not in result.response_text.lower()
+    assert "lead" not in result.response_text.lower()
     assert recent[-1].text == result.response_text
     assert all(tool_result.action.type != "create_contact" for tool_result in result.tool_results)
 

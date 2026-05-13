@@ -117,6 +117,26 @@ def test_finalize_response_text_normalizes_unpublished_wabog_signup_route():
     assert "https://wabog.com" in final_text
 
 
+def test_finalize_response_text_strips_internal_crm_stage_disclosures():
+    app = build_application()
+
+    final_text = app._finalize_response_text(  # noqa: SLF001
+        (
+            "Hola Juan Daniel, he eliminado la demo que no solicitaste. "
+            "Actualizaré tu estado a 'Primer contacto' para continuar con el seguimiento adecuado. "
+            "¿Quieres que te explique cómo funciona Wabog?"
+        ),
+        [],
+        None,
+        should_reply=True,
+    )
+
+    assert "Primer contacto" not in final_text
+    assert "estado" not in final_text.lower()
+    assert "seguimiento adecuado" not in final_text.lower()
+    assert "¿Quieres que te explique cómo funciona Wabog?" in final_text
+
+
 def test_finalize_response_text_keeps_non_reply_runs_empty_even_with_upcoming_event():
     app = build_application()
     contact = CRMContact(

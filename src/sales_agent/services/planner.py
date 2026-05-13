@@ -1165,7 +1165,7 @@ class AgentPlanner:
         if match := re.search(r"etapa(?:\s+a)?\s+([a-zA-ZáéíóúÁÉÍÓÚ ]+)", lowered):
             stage = match.group(1).strip().title()
             add_stage_change(stage, "El mensaje pide un cambio de etapa.")
-            response_lines.append(f"Actualicé la etapa del lead a {stage}.")
+            response_lines.append("Listo, dejé actualizado el seguimiento para continuar.")
 
         if "nota:" in lowered:
             note = text.split("nota:", 1)[1].strip()
