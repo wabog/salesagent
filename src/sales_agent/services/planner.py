@@ -248,8 +248,6 @@ class AgentPlanner:
         upcoming_event = self._get_upcoming_calendar_event(contact)
         name_validation = dict((metadata.get("name_validation") or {}))
         effective_name = get_effective_contact_name(contact)
-        candidate_name = get_name_confirmation_candidate(contact)
-        provider_name = (metadata.get("provider_name") or "").strip() or None
         rendered = {
             "external_id": contact.external_id,
             "phone_number": contact.phone_number,
@@ -261,15 +259,15 @@ class AgentPlanner:
             "recent_notes": contact.notes[-self._settings.crm_notes_context_limit :],
             "live_context": {
                 "effective_name": effective_name,
-                "candidate_name": None if effective_name else candidate_name,
-                "provider_name_hint": None if effective_name else provider_name,
+                "candidate_name": None,
+                "provider_name_hint": None,
             },
             "metadata": {
                 "name_validation": {
                     "status": name_validation.get("status"),
                     "confidence": name_validation.get("confidence"),
                     "source": name_validation.get("source"),
-                    "candidate_name": None if effective_name else candidate_name,
+                    "candidate_name": None,
                 }
                 if name_validation
                 else None,
@@ -403,13 +401,10 @@ class AgentPlanner:
     ) -> PlanningResult:
         if decision.special_case_intent == "ask_name":
             full_name = get_effective_contact_name(contact) or ""
-            candidate_name = get_name_confirmation_candidate(contact)
             if contact_has_reliable_name(contact):
                 response_text = f"Te tengo registrado como {full_name}."
-            elif candidate_name:
-                response_text = f"Te tengo como {candidate_name}, pero prefiero confirmarlo contigo. ¿Ese es tu nombre?"
             else:
-                response_text = "Todavía no tengo tu nombre registrado. Si quieres, compártemelo y lo guardo."
+                response_text = "Todavía no tengo un nombre confiable registrado."
             return PlanningResult(
                 intent="ask_name",
                 confidence=max(decision.special_case_confidence, 0.9),
@@ -1070,32 +1065,15 @@ class AgentPlanner:
 
     def _missing_contact_fields_for_meeting(self, contact: CRMContact | None) -> list[str]:
         if contact is None:
-            return ["full_name", "email"]
+            return ["email"]
         missing: list[str] = []
-        if not contact_has_reliable_name(contact):
-            missing.append("full_name")
         if not (contact.email or "").strip():
             missing.append("email")
         return missing
 
     def _build_missing_meeting_fields_response(self, missing_fields: list[str], contact: CRMContact | None = None) -> str:
-        candidate_name = get_name_confirmation_candidate(contact)
-        if missing_fields == ["full_name", "email"]:
-            if candidate_name:
-                return (
-                    f"Perfecto. Antes de dejarte la demo agendada, ¿tu nombre es {candidate_name}? "
-                    "Y de una vez compárteme también tu correo para enviarte la invitación."
-                )
-            return (
-                "Perfecto. Para dejarte la demo agendada y enviarte la invitación, "
-                "compárteme tu nombre completo y tu correo."
-            )
         if missing_fields == ["email"]:
             return "Perfecto. Para enviarte la invitación de la demo, compárteme tu correo."
-        if missing_fields == ["full_name"]:
-            if candidate_name:
-                return f"Perfecto. Antes de agendarla, ¿tu nombre es {candidate_name}? Si no, compárteme tu nombre completo."
-            return "Perfecto. Antes de agendarla, compárteme tu nombre completo."
         return (
             "Perfecto. Antes de dejar la demo agendada, compárteme los datos que me faltan "
             "para enviarte la invitación."
@@ -1259,42 +1237,7 @@ class AgentPlanner:
         candidate_name = get_name_confirmation_candidate(contact)
         if not candidate_name:
             return response_text
-        if (
-            name_confirmation is not None
-            and name_confirmation.status in {"confirmed_candidate_name", "provided_new_name"}
-            and name_confirmation.resolved_name
-        ):
-            return response_text
-        if self._recently_asked_to_confirm_candidate_name(candidate_name, recent_messages or []):
-            return self._strip_redundant_pending_name_prompt(response_text, candidate_name)
-        prompt = (
-            f"Antes de seguir, ¿tu nombre es {candidate_name}? "
-            "Si no, compárteme tu nombre completo."
-        )
-        normalized_response = response_text.strip()
-        if not normalized_response:
-            return prompt
-        lowered_response = normalized_response.lower()
-        if candidate_name.lower() in lowered_response and "nombre" in lowered_response:
-            return normalized_response
-        if prompt in normalized_response:
-            return normalized_response
-        return f"{normalized_response} {prompt}".strip()
-
-    def _recently_asked_to_confirm_candidate_name(self, candidate_name: str, recent_messages: list[str]) -> bool:
-        normalized_candidate = self._normalize_lookup_text(candidate_name)
-        if not normalized_candidate:
-            return False
-        for message in reversed(recent_messages[-8:]):
-            normalized_message = self._normalize_lookup_text(message)
-            if normalized_candidate not in normalized_message:
-                continue
-            if "nombre" in normalized_message and any(
-                token in normalized_message
-                for token in ("confirm", "ese es", "tu nombre", "registrado", "tengo como")
-            ):
-                return True
-        return False
+        return self._strip_redundant_pending_name_prompt(response_text, candidate_name)
 
     def _strip_redundant_pending_name_prompt(self, response_text: str, candidate_name: str) -> str:
         normalized_response = response_text.strip()

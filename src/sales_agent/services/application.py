@@ -36,7 +36,6 @@ from sales_agent.services.name_validation import (
     ContactNameValidator,
     apply_name_validation_metadata,
     build_trusted_name_assessment,
-    contact_has_reliable_name,
     get_effective_contact_name,
 )
 from sales_agent.services.planner import AgentPlanner
@@ -521,8 +520,6 @@ class SalesAgentApplication:
 
         if failed_meeting is not None:
             missing_fields: list[str] = []
-            if contact is None or not contact_has_reliable_name(contact):
-                missing_fields.append("nombre completo")
             if contact is None or not (contact.email or "").strip():
                 missing_fields.append("correo")
             if missing_fields:

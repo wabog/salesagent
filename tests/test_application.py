@@ -99,7 +99,7 @@ def test_finalize_response_text_degrades_failed_meeting_when_contact_data_missin
     )
 
     assert "todavía no la dejo agendada" in final_text.lower()
-    assert "nombre completo" in final_text.lower()
+    assert "nombre completo" not in final_text.lower()
     assert "correo" in final_text.lower()
 
 
@@ -410,7 +410,8 @@ async def test_handle_event_e2e_confirms_candidate_name_by_context_and_books_dem
     finally:
         await app.shutdown()
 
-    assert "compárteme tu nombre completo" in first.response_text.lower()
+    assert "compárteme tu nombre completo" not in first.response_text.lower()
+    assert "tu nombre es fabian c villegas" not in first.response_text.lower()
     assert "ya te dejé la demo agendada" in second.response_text.lower()
     assert "compárteme tu nombre completo" not in second.response_text.lower()
     assert any(item.action.type == ActionType.CREATE_MEETING and item.success for item in second.tool_results)
@@ -534,8 +535,9 @@ async def test_handle_event_e2e_prod_conversation_books_and_reprograms_without_n
     finally:
         await app.shutdown()
 
-    pending_name_reply = results[0].response_text
-    assert "tu nombre es fabian c villegas" in pending_name_reply.lower()
+    first_reply = results[0].response_text
+    assert "tu nombre es fabian c villegas" not in first_reply.lower()
+    assert "nombre completo" not in first_reply.lower()
 
     contact_after_name = results[4].contact
     assert contact_after_name is not None

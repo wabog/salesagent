@@ -277,7 +277,7 @@ def test_build_meeting_payload_uses_recent_afternoon_context_for_bare_hour():
     assert "T18:00:00" in payload["start_iso"]
 
 
-def test_planning_guardrail_requests_name_and_email_before_creating_meeting():
+def test_planning_guardrail_requests_email_before_creating_meeting():
     planner = build_planner()
     contact = CRMContact(
         external_id="lead-1",
@@ -307,7 +307,7 @@ def test_planning_guardrail_requests_name_and_email_before_creating_meeting():
     )
 
     assert all(action.type != ActionType.CREATE_MEETING for action in guarded.actions)
-    assert "nombre completo" in guarded.response_text.lower()
+    assert "nombre completo" not in guarded.response_text.lower()
     assert "correo" in guarded.response_text.lower()
 
 
@@ -556,6 +556,44 @@ def test_planning_guardrail_does_not_repeat_pending_name_prompt_after_it_was_ask
     assert "enterprise" in guarded.response_text.lower()
     assert "tu nombre es fabian c villegas" not in guarded.response_text.lower()
     assert "compárteme tu nombre completo" not in guarded.response_text.lower()
+
+
+def test_planning_guardrail_does_not_append_pending_name_prompt_during_qualification():
+    planner = build_planner()
+    contact = CRMContact(
+        external_id="lead-1",
+        phone_number="3150000000",
+        full_name="En la área de rescate jurídico",
+        email=None,
+        metadata={
+            "name_validation": {
+                "status": "needs_confirmation",
+                "candidate_name": "En La Área De Rescate Jurídico",
+                "normalized_name": "En La Área De Rescate Jurídico",
+                "source": "provider",
+            }
+        },
+    )
+    result = PlanningResult(
+        intent="qualify_lead",
+        confidence=0.84,
+        response_text=(
+            "Perfecto, 50 procesos ya me da una buena idea. "
+            "¿Hoy los siguen manualmente o usan algún sistema de alertas?"
+        ),
+        actions=[],
+    )
+
+    guarded = planner._apply_planning_guardrail(  # noqa: SLF001
+        result,
+        "50",
+        contact,
+        ["Gracias por comunicarte con Rescate jurídico. ¿Cómo podemos ayudarte?"],
+    )
+
+    assert "rescate jurídico" not in guarded.response_text.lower()
+    assert "nombre" not in guarded.response_text.lower()
+    assert guarded.response_text == result.response_text
 
 
 def test_planning_guardrail_strips_llm_repeated_pending_name_prompt_after_it_was_asked():
@@ -1015,11 +1053,11 @@ async def test_contextual_special_case_asks_for_name_when_contact_name_is_missin
 
     assert result.intent == "ask_name"
     assert result.actions == []
-    assert "todavía no tengo tu nombre" in result.response_text.lower()
+    assert "todavía no tengo un nombre confiable registrado" in result.response_text.lower()
 
 
 @pytest.mark.asyncio
-async def test_contextual_special_case_asks_to_confirm_candidate_name_when_it_is_not_trusted_yet():
+async def test_contextual_special_case_does_not_ask_to_confirm_candidate_name_when_it_is_not_trusted_yet():
     planner = build_planner()
     planner._semantic_guardrail_llm = _FakeSemanticGuardrailLLM(  # noqa: SLF001
         special_case_intent="ask_name",
@@ -1043,8 +1081,9 @@ async def test_contextual_special_case_asks_to_confirm_candidate_name_when_it_is
     result = await planner.plan("como me llamo", contact, [], [])
 
     assert result.intent == "ask_name"
-    assert "juan" in result.response_text.lower()
-    assert "confirmarlo" in result.response_text.lower()
+    assert "juan" not in result.response_text.lower()
+    assert "confirmarlo" not in result.response_text.lower()
+    assert "nombre confiable" in result.response_text.lower()
 
 
 @pytest.mark.asyncio
@@ -1063,7 +1102,7 @@ async def test_contextual_special_case_does_not_treat_phone_number_as_contact_na
     result = await planner.plan("como me llamo", contact, [], [])
 
     assert result.intent == "ask_name"
-    assert "todavía no tengo tu nombre" in result.response_text.lower()
+    assert "todavía no tengo un nombre confiable registrado" in result.response_text.lower()
 
 
 @pytest.mark.asyncio
@@ -1093,7 +1132,7 @@ def test_append_calendar_confirmation_removes_unsupported_reminder_promise():
     assert "veo en calendario una demo futura" in response_text.lower()
 
 
-def test_missing_meeting_fields_response_confirms_candidate_name_before_booking():
+def test_missing_meeting_fields_response_requests_only_email_before_booking():
     planner = build_planner()
     contact = CRMContact(
         external_id="lead-1",
@@ -1110,9 +1149,10 @@ def test_missing_meeting_fields_response_confirms_candidate_name_before_booking(
         },
     )
 
-    response = planner._build_missing_meeting_fields_response(["full_name"], contact)  # noqa: SLF001
+    response = planner._build_missing_meeting_fields_response(["email"], contact)  # noqa: SLF001
 
-    assert "tu nombre es Juan" in response
+    assert "correo" in response.lower()
+    assert "nombre" not in response.lower()
 
 
 @pytest.mark.asyncio
