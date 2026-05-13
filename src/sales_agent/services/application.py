@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -47,19 +46,6 @@ from sales_agent.services.prompt_library import PromptLibrary
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
-
-INTERNAL_STAGE_NAMES = (
-    "Prospecto",
-    "Primer contacto",
-    "Demo agendada",
-    "Demo realizada",
-    "Propuesta enviada",
-    "Negociación",
-    "Prueba / Trial",
-    "Cliente",
-    "Perdido",
-    "No califica",
-)
 
 
 def _merge_unique_messages(*message_groups: list[ConversationMessage], limit: int) -> list[ConversationMessage]:
@@ -558,29 +544,7 @@ class SalesAgentApplication:
         upcoming_event = self.workflow.planner._get_upcoming_calendar_event(contact)  # noqa: SLF001
         if upcoming_event and not final_text:
             return f"Veo una demo futura agendada para {upcoming_event.get('start_iso')}."
-        return self._strip_internal_crm_disclosures(final_text)
-
-    @staticmethod
-    def _strip_internal_crm_disclosures(response_text: str) -> str:
-        if not response_text:
-            return response_text
-
-        stage_pattern = "|".join(re.escape(stage) for stage in INTERNAL_STAGE_NAMES)
-        internal_terms = (
-            r"etapa|estado|pipeline|crm|lead|mover(?:te)?|pasar(?:te)?|"
-            r"actualizar(?:e|é| tu| el)?|cambiar(?:e|é| tu|te)?|"
-            r"marcar(?:e|é|te)?|clasificar(?:e|é|te)?"
-        )
-        sentence_pattern = re.compile(
-            rf"(^|(?<=[.!?])\s+)([^.!?\n]*(?:{internal_terms})[^.!?\n]*(?:{stage_pattern})[^.!?\n]*[.!?]?)",
-            flags=re.IGNORECASE,
-        )
-        sanitized = sentence_pattern.sub(r"\1", response_text).strip()
-        sanitized = re.sub(r"\s{2,}", " ", sanitized)
-
-        if not sanitized:
-            return "Gracias por la claridad. Sigo atento para ayudarte con Wabog."
-        return sanitized
+        return final_text
 
     async def _sync_crm_after_meeting_created(
         self,
