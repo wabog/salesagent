@@ -11,6 +11,14 @@ from sales_agent.domain.phones import normalize_phone_number
 from sales_agent.domain.models import CRMContact, ConversationMessage, InboundMessage, KnowledgeLookup, ToolExecutionResult
 
 
+MAX_INTENT_LENGTH = 128
+
+
+def _bounded_intent(intent: str | None) -> str:
+    normalized = " ".join((intent or "unknown").split()) or "unknown"
+    return normalized[:MAX_INTENT_LENGTH]
+
+
 class SqlAlchemyMemoryStore:
     def __init__(self, session_factory: async_sessionmaker) -> None:
         self._session_factory = session_factory
@@ -184,6 +192,7 @@ class SqlAlchemyMemoryStore:
         tool_results: list[ToolExecutionResult],
         knowledge_lookups: list[KnowledgeLookup],
     ) -> None:
+        bounded_intent = _bounded_intent(intent)
         for _ in range(2):
             async with self._session_factory() as session:
                 session.add(
@@ -192,7 +201,7 @@ class SqlAlchemyMemoryStore:
                         conversation_id=event.conversation_id,
                         message_id=event.message_id,
                         phone_number=event.phone_number,
-                        intent=intent,
+                        intent=bounded_intent,
                         response_text=response_text,
                         tool_results_json=[result.model_dump(mode="json") for result in tool_results],
                         knowledge_lookups_json=[lookup.model_dump(mode="json") for lookup in knowledge_lookups],
@@ -205,7 +214,7 @@ class SqlAlchemyMemoryStore:
                         phone_number=event.phone_number,
                     )
                     session.add(thread)
-                thread.last_intent = intent
+                thread.last_intent = bounded_intent
                 try:
                     await session.commit()
                     return
